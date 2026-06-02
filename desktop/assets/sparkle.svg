@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs><linearGradient id="spk" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#79b4ff"/>
+  </linearGradient></defs>
+  <path d="M 512 162 C 512 392 632 512 862 512 C 632 512 512 632 512 862 C 512 632 392 512 162 512 C 392 512 512 392 512 162 Z" fill="url(#spk)"/>
+</svg>
