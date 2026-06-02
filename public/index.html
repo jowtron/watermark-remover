@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watermark Remover — clean-room (self-learning)</title>
+<style>
+  :root{ --bg:#0e1117; --panel:#161b22; --line:#2b3240; --txt:#e6edf3; --mut:#9aa6b2; --accent:#3b82f6; --good:#22c55e; --warn:#f59e0b; }
+  *{ box-sizing:border-box } body{ margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt) }
+  header{ padding:18px 22px; border-bottom:1px solid var(--line) } h1{ font-size:18px; margin:0 }
+  header p{ margin:4px 0 0; color:var(--mut); font-size:12.5px }
+  .tabs{ display:flex; gap:6px; padding:12px 22px 0 }
+  .tab{ padding:8px 14px; border:1px solid var(--line); border-bottom:none; border-radius:8px 8px 0 0; cursor:pointer; background:var(--panel); color:var(--mut) }
+  .tab.active{ color:var(--txt); background:var(--bg); border-color:var(--accent); border-bottom:1px solid var(--bg); margin-bottom:-1px }
+  main{ padding:18px 22px; max-width:1080px }
+  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px }
+  .row{ display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end } .col{ flex:1; min-width:150px }
+  label{ display:block; font-size:12px; color:var(--mut); margin:0 0 4px }
+  select,input[type=number],input[type=color]{ width:100%; padding:7px 8px; background:var(--bg); border:1px solid var(--line); border-radius:7px; color:var(--txt) }
+  input[type=range]{ width:100% }
+  button{ padding:9px 14px; border:1px solid var(--line); background:#21283280; color:var(--txt); border-radius:8px; cursor:pointer; font-weight:600 }
+  button.primary{ background:var(--accent); border-color:var(--accent); color:#fff } button:disabled{ opacity:.45; cursor:not-allowed }
+  .drop{ border:1.5px dashed var(--line); border-radius:10px; padding:26px; text-align:center; color:var(--mut); cursor:pointer; transition:.15s }
+  .drop:hover,.drop.over{ border-color:var(--accent); color:var(--txt) }
+  canvas{ max-width:100%; border:1px solid var(--line); border-radius:8px; background:#0008 }
+  .hint{ font-size:12px; color:var(--mut) } .small{ font-size:12px }
+  .badge{ font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid var(--line) }
+  .ok{ color:var(--good); border-color:#1f7a3f } .bad{ color:var(--warn); border-color:#7a5a1f }
+  code{ background:#0008; padding:1px 5px; border-radius:5px } details{ margin-top:10px } summary{ cursor:pointer; color:var(--mut) }
+  .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:14px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Watermark Remover — clean-room <span class="hint">self-learning, in-browser</span></h1>
+  <p>Ships with a Gemini-star profile measured from a real watermarked image (harmonic inpaint + alpha-matting) — works out of the box. The Learn tab can re-derive any watermark from a batch of your own images (no clean originals, no labeling, no third-party data).</p>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="learn">1 · Learn watermark</div>
+  <div class="tab" data-tab="remove">2 · Remove</div>
+  <div class="tab" data-tab="about">How it works</div>
+</div>
+
+<main>
+<!-- ===================== LEARN ===================== -->
+<section id="learn">
+  <div class="panel">
+    <b>Learn the watermark from a batch of images</b>
+    <p class="hint">Drop <b>~20–60 different watermarked images</b> that all carry the <b>same</b> watermark in the <b>same corner</b> (e.g. a folder of Gemini outputs). More images = cleaner result. The watermark is the one consistent thing across them, so it can be recovered statistically while the varied picture content cancels out.</p>
+    <div class="drop" id="learnDrop">Drop watermarked images here, or click</div>
+    <input type="file" id="learnFiles" accept="image/*" multiple hidden>
+    <div class="row" style="margin-top:12px">
+      <div class="col">
+        <label>Corner</label>
+        <select id="learnCorner"><option value="br">Bottom-right</option><option value="bl">Bottom-left</option><option value="tr">Top-right</option><option value="tl">Top-left</option></select>
+      </div>
+      <div class="col">
+        <label>Watermark size</label>
+        <select id="learnSize"><option value="auto">Auto (96 if image ≥1024, else 48)</option><option value="96">96 px</option><option value="48">48 px</option></select>
+      </div>
+      <div class="col" style="flex:0 0 auto">
+        <button class="primary" id="learnBtn" disabled>Learn watermark</button>
+      </div>
+    </div>
+    <div class="small" id="learnStatus" style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel" id="profPanel" style="display:none">
+    <b>Learned profile</b>
+    <div class="grid2" style="margin-top:10px">
+      <div><div class="hint">Recovered α (opacity) — white = opaque</div><canvas id="alphaCv"></canvas></div>
+      <div><div class="hint">Watermark preview (over dark)</div><canvas id="wmCv"></canvas></div>
+    </div>
+    <div class="small" id="profMeta" style="margin-top:10px"></div>
+    <div style="margin-top:10px">
+      <button id="saveProf">Download profile JSON</button>
+      <button id="loadProfBtn">Load profile JSON…</button>
+      <input type="file" id="profFile" accept="application/json,.json" hidden>
+      <span class="hint">Saved in this browser automatically.</span>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== REMOVE ===================== -->
+<section id="remove" style="display:none">
+  <div class="panel"><b>Active profile:</b> <span id="activeProf" class="badge bad">none — learn one first</span></div>
+  <div class="panel">
+    <div class="drop" id="drop">Drop a watermarked image here, or click</div>
+    <input type="file" id="file" accept="image/*" hidden>
+    <div class="small" id="status" style="margin-top:10px"></div>
+  </div>
+  <div class="panel" id="controls" style="display:none">
+    <div class="row">
+      <div class="col"><label>Corner</label>
+        <select id="corner"><option value="auto">Auto-detect</option><option value="br">Bottom-right</option><option value="bl">Bottom-left</option><option value="tr">Top-right</option><option value="tl">Top-left</option></select></div>
+      <div class="col"><label>Nudge X / Y</label><div class="row" style="gap:8px"><input type="number" id="nudgeX" value="0"><input type="number" id="nudgeY" value="0"></div></div>
+      <div class="col"><label>Watermark color</label><input type="color" id="wcolor" value="#ffffff"></div>
+      <div class="col"><label>Opacity calibration <span id="sv">100%</span> <span class="hint">raise if mark remains</span></label><input type="range" id="strength" min="20" max="220" value="100"></div>
+      <div class="col" style="flex:0 0 auto"><button class="primary" id="run">Re-run</button></div>
+    </div>
+    <div class="small" id="detinfo" style="margin-top:10px"></div>
+  </div>
+  <div class="panel" id="result" style="display:none">
+    <div class="row" style="align-items:center">
+      <label style="margin:0"><input type="checkbox" id="outline" checked> outline</label>
+      <label style="margin:0"><input type="checkbox" id="before"> original</label>
+      <label style="margin:0"><input type="checkbox" id="zoom"> zoom</label>
+      <div style="flex:1"></div><button class="primary" id="dl">Download PNG</button>
+    </div>
+    <div style="margin-top:12px"><canvas id="cv"></canvas></div>
+  </div>
+</section>
+
+<!-- ===================== ABOUT ===================== -->
+<section id="about" style="display:none">
+  <div class="panel small" style="color:var(--mut)">
+    <b style="color:var(--txt)">Why this is clean-room</b>
+    <p>Nothing here is taken from any watermark-removal product. The watermark profile is measured from <i>your own</i> images using a published, generic statistical idea:</p>
+    <ul>
+      <li><b>Learning.</b> The watermark is a fixed, mostly-white overlay added the same way to every image: <code>observed = original·(1−α) + 255·α</code>. Across many varied images, at each watermark pixel the darkest observed values occur when the underlying picture is dark there, so the low percentile of observed luminance ≈ <code>255·α</code>. Taking a low percentile per pixel across the batch (and subtracting the surrounding background level) recovers α directly; picture content, being different in every image, cancels out.</li>
+      <li><b>Removal.</b> With α known, the composite is reversed exactly: <code>original = (observed − 255·α)/(1−α)</code>. The watermark's position in each new image is found by correlating the learned α-shape against the local brightening.</li>
+    </ul>
+    <p>Give it enough varied images (20+) and the recovered watermark is essentially identical to the true one.</p>
+  </div>
+</section>
+</main>
+
+<script>
+"use strict";
+const $=s=>document.querySelector(s), clamp=(v,a,b)=>v<a?a:v>b?b:v;
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');['learn','remove','about'].forEach(id=>$('#'+id).style.display='none');$('#'+t.dataset.tab).style.display='';});
+
+/* learned profiles, keyed by size; each = {size, mean, varsum, a:Float32Array} */
+const MAPS={};
+function setMap(size,a){ let s=0,ss=0; for(const v of a){s+=v;ss+=v*v;} MAPS[size]={size,a,mean:s/a.length,varsum:ss-s*s/a.length}; }
+/* built-in default 96px Gemini-star profile, measured from a real watermarked image
+   (harmonic-inpaint + white-alpha matting). Lets the tool work on first load; the Learn
+   tab can still derive a custom watermark and override this. */
+const DEFAULT96="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gYKBgH6BgX+AgoU7boCDf4OBfn+AgYGAg4CAg4KCf4CBfn+Agn1+fH1/gIJ9f4B/f3+BgX+AgH+Efn5+fn2Bfn+BgIGBeHp3eH58fXx6fH1+f4F/fHp5f318fHx+fYGBgoKCf4GBgH9/gIJ2dn98fIF+f3+Ag4F/gX6AgYSAf4KCf36Dg35+gXyBhIF+f39/gH+EgIF/gH+Bf36Ef39/fH2Afnt6enh6eH16foF9gH18fYCAeXt+eHp8enx8gH18gH5+f4CBhYCAgIFyNX1+f4N9fn+Df4CDgYGDfn+BgYGAgYGAf4CDg4CAfYOCf36CgoB/gX6EgoB/hIGCgXx+gH99fnh8dnuAfnp6fYF+fXx6gH2AfX10fXx3eX2Agn9/fIB/g4KAgoOAgYI3ABIoT3J+fYCCfoCEgYGCgYCDhIKAg4OAf4CBgX57fIGAfn6Bg396f4CDhICAgoR/fnx7gIB9fn59eXmAgH19e359eHd6gH55fXZzd3V3dHx+gn9+fYKAgIKCgnhVNxEDAAIAAAAgT3CDgH6Agn+BgYCBfYB/f4B/f4KAg4N9fICAgIOBg3+AgX5/f399f4B/hH1+gYGBg3+Af35+f4GAfoF8fX56fn18fndzdHd4fnx9f398fH99gHZIHgAACAMHAAACBgQAAAAoV4CAgoOCf36AfX2AgIGAgYOChIN/g4OCgX9/gIB+goCAfYKAg32Cg4CBf36Bg397gX19fXyAfn96fX56e39+gHp1e3uAgH19foKCgH1eJQgCAAECBwgAAAAABAAEAAUFABVRgYF/goN9gYGDf3+DgIGCg4GAhIF9gIF/gYSDgYCDgH57gICAf35/f35+foF+fH2Af36Bf36BhHp8gYB8fn5+d3iBe31+gYF2QQoAAAkABAcAAQEDBQAAAAAAAgsAAAMCEj5ugoF/f4SBf4CEgoKEgH5+f4B7gIWBgoSFgn9/dXZ/gIGDgX57gH2AgX52fIGCgIKAfX6Afn16gIF9e319ent7fHx+eEEFAAAAAAACAAADAQMIBAQAAAAAAAgFAAUDBAANVIOCgoKCg4SCgYGAgIF+fn99f4CBgYGAgIF9bmx2gn+Dgn6Bf4B9f3lyeHmDfn9/fXt/f39/f399fH2BfHh1dHU+AgAAAwADAAgFAAMGAgMJAgABCAAAAAELBwgAAAAEAxdPgICAgoOB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";
+function loadDefault(){ if(!DEFAULT96||DEFAULT96.indexOf("_")===0)return; const bin=atob(DEFAULT96);const f=new Float32Array(bin.length);for(let i=0;i<bin.length;i++)f[i]=bin.charCodeAt(i)/255; setMap(96,f); }
+
+/* ---------- image helpers ---------- */
+function fileToImageData(file){return new Promise((res,rej)=>{const img=new Image();img.onload=()=>{const c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(img,0,0);res({data:x.getImageData(0,0,c.width,c.height),width:c.width,height:c.height,name:file.name});};img.onerror=rej;img.src=URL.createObjectURL(file);});}
+function lumOf(id){const d=id.data,n=id.width*id.height,L=new Float32Array(n);for(let i=0,p=0;p<n;i+=4,p++)L[p]=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];return L;}
+function wireDrop(dropEl,inputEl,cb){dropEl.onclick=()=>inputEl.click();dropEl.ondragover=e=>{e.preventDefault();dropEl.classList.add('over');};dropEl.ondragleave=()=>dropEl.classList.remove('over');dropEl.ondrop=e=>{e.preventDefault();dropEl.classList.remove('over');cb([...e.dataTransfer.files]);};inputEl.onchange=()=>cb([...inputEl.files]);}
+
+/* ================= LEARN ================= */
+let learnImgs=[];
+wireDrop($('#learnDrop'),$('#learnFiles'),async fs=>{ $('#learnStatus').textContent='Loading…';
+  for(const f of fs){ try{ learnImgs.push(await fileToImageData(f)); }catch(e){} }
+  $('#learnBtn').disabled=learnImgs.length<6;
+  $('#learnStatus').innerHTML=`${learnImgs.length} image(s) loaded.`+(learnImgs.length<20?' <span class="badge bad">20+ recommended for a clean result</span>':' <span class="badge ok">good</span>');
+});
+
+$('#learnBtn').onclick=()=>{
+  const corner=$('#learnCorner').value;
+  // choose size
+  let size; const sv=$('#learnSize').value;
+  if(sv!=='auto') size=+sv; else { let big=0; for(const im of learnImgs) if(im.width>=1024&&im.height>=1024) big++; size=(big>=learnImgs.length/2)?96:48; }
+  const T=size;
+  // common crop window anchored at corner (so watermark aligns across different image sizes)
+  let minW=1e9,minH=1e9; for(const im of learnImgs){ minW=Math.min(minW,im.width); minH=Math.min(minH,im.height); }
+  const CROP=Math.min(4*T, minW, minH);
+  if(CROP<T+8){ $('#learnStatus').textContent='Images too small for this watermark size.'; return; }
+  const ax=(im)=> (corner==='br'||corner==='tr') ? im.width-CROP : 0;   // crop origin x
+  const ay=(im)=> (corner==='bl'||corner==='br') ? im.height-CROP : 0;  // crop origin y
+
+  // gather per-pixel luminance across images for the crop window
+  const N=learnImgs.length, stacks=new Float32Array(N*CROP*CROP);
+  learnImgs.forEach((im,k)=>{ const L=lumOf(im.data), ox=ax(im), oy=ay(im);
+    for(let y=0;y<CROP;y++)for(let x=0;x<CROP;x++) stacks[(y*CROP+x)*N+k]=L[(oy+y)*im.width+(ox+x)];
+  });
+  // low percentile per pixel  ~  255*alpha  (+ residual background)
+  const pIdx=Math.min(N-1,Math.max(0,Math.round(0.05*(N-1))));
+  const P=new Float32Array(CROP*CROP), buf=new Float32Array(N);
+  for(let p=0;p<CROP*CROP;p++){ for(let k=0;k<N;k++)buf[k]=stacks[p*N+k]; buf.sort(); P[p]=buf[pIdx]; }
+  // localize the brightest TxT window in P (integral image)
+  const II=new Float64Array((CROP+1)*(CROP+1));
+  for(let y=0;y<CROP;y++){let row=0;for(let x=0;x<CROP;x++){row+=P[y*CROP+x];II[(y+1)*(CROP+1)+(x+1)]=II[y*(CROP+1)+(x+1)]+row;}}
+  const win=(x,y)=>II[(y+T)*(CROP+1)+(x+T)]-II[y*(CROP+1)+(x+T)]-II[(y+T)*(CROP+1)+x]+II[y*(CROP+1)+x];
+  let best={s:-1}; for(let y=0;y<=CROP-T;y++)for(let x=0;x<=CROP-T;x++){const s=win(x,y);if(s>best.s)best={s,x,y};}
+  // background level from a ring just outside the tile
+  let bs=0,bn=0,R=10; for(let y=-R;y<T+R;y++)for(let x=-R;x<T+R;x++){ if(x>=0&&x<T&&y>=0&&y<T)continue;
+    const gx=best.x+x,gy=best.y+y; if(gx<0||gy<0||gx>=CROP||gy>=CROP)continue; bs+=P[gy*CROP+gx];bn++; }
+  const Pbg=bs/bn;
+  // alpha map
+  const a=new Float32Array(T*T);
+  for(let y=0;y<T;y++)for(let x=0;x<T;x++){ const v=P[(best.y+y)*CROP+(best.x+x)]; a[y*T+x]=clamp((v-Pbg)/(255-Pbg),0,1); }
+  setMap(size,a);
+  persist();
+  showProfile(size);
+  let peak=0,foot=0; for(const v of a){ if(v>peak)peak=v; if(v>0.02)foot++; }
+  $('#learnStatus').innerHTML=`Learned <b>${T}×${T}</b> watermark in <b>${corner}</b> from ${N} images · peak α ${peak.toFixed(2)} · footprint ${foot}px`;
+  refreshActive();
+};
+
+function showProfile(size){
+  const m=MAPS[size], T=size; $('#profPanel').style.display='';
+  const aImg=new ImageData(T,T); for(let i=0,k=0;i<aImg.data.length;i+=4,k++){const a=m.a[k]*255;aImg.data[i]=aImg.data[i+1]=aImg.data[i+2]=a;aImg.data[i+3]=255;}
+  const c1=$('#alphaCv');c1.width=T;c1.height=T;c1.getContext('2d').putImageData(aImg,0,0);
+  const wImg=new ImageData(T,T); for(let i=0,k=0;i<wImg.data.length;i+=4,k++){wImg.data[i]=wImg.data[i+1]=wImg.data[i+2]=255;wImg.data[i+3]=m.a[k]*255;}
+  const c2=$('#wmCv');c2.width=T;c2.height=T;c2.getContext('2d').putImageData(wImg,0,0);
+  $('#profMeta').textContent=`size ${T}×${T}`;
+}
+
+/* persistence */
+function persist(){ const o={}; for(const k in MAPS){ if(!Number.isFinite(+k))continue; o[k]=Array.from(MAPS[k].a, v=>Math.round(v*255)); } try{localStorage.setItem('wmProfiles_v2',JSON.stringify(o));}catch(e){} }
+function restore(){ try{ if(localStorage.getItem('cleanProfiles')!==null){ localStorage.removeItem('cleanProfiles'); localStorage.removeItem('wmStrength'); } // one-time migration to the baked corrected profile
+  const o=JSON.parse(localStorage.getItem('wmProfiles_v2')||'{}'); for(const k in o){ if(!Number.isFinite(+k)||!Array.isArray(o[k]))continue; const a=new Float32Array(o[k].length); for(let i=0;i<a.length;i++)a[i]=o[k][i]/255; setMap(+k,a); } }catch(e){} }
+$('#saveProf').onclick=()=>{ const o={}; for(const k in MAPS) o[k]=Array.from(MAPS[k].a, v=>Math.round(v*255)); o.calibration=+$('#strength').value; const blob=new Blob([JSON.stringify(o)],{type:'application/json'}); const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='watermark-profile.json';a.click(); };
+$('#loadProfBtn').onclick=()=>$('#profFile').click();
+$('#profFile').onchange=async()=>{ const f=$('#profFile').files[0]; if(!f)return; const o=JSON.parse(await f.text());
+  for(const k in o){ if(!Number.isFinite(+k)||!Array.isArray(o[k]))continue; const a=new Float32Array(o[k].length); for(let i=0;i<a.length;i++)a[i]=o[k][i]/255; setMap(+k,a); } persist();
+  if(o.calibration){ $('#strength').value=o.calibration; $('#sv').textContent=o.calibration+'%'; try{localStorage.setItem('wmStrength',o.calibration);}catch(e){} }
+  const sz=Object.keys(MAPS)[0]; showProfile(+sz); refreshActive(); $('#learnStatus').textContent='Profile loaded.'; };
+
+/* ================= REMOVE (same engine as the baked tool) ================= */
+let SRC=null,LAST=null;
+function refreshActive(){ const sizes=Object.keys(MAPS).filter(s=>Number.isFinite(+s)); const b=$('#activeProf');
+  if(sizes.length){ b.className='badge ok'; b.textContent=sizes.map(s=>s+'px').join(', ')+' profile ready'; }
+  else { b.className='badge bad'; b.textContent='none — learn one first'; }
+}
+function pickSize(){ const sizes=Object.keys(MAPS).map(Number).filter(Number.isFinite); if(!sizes.length)return null;
+  if(SRC){ const want=(SRC.width>=1024&&SRC.height>=1024)?96:48; if(MAPS[want])return want; } return sizes[0]; }
+wireDrop($('#drop'),$('#file'),async fs=>{ if(!fs[0])return; if(!Object.keys(MAPS).length){$('#status').innerHTML='<span class="badge bad">Learn a watermark first (tab 1).</span>';return;}
+  $('#status').textContent='Loading…'; SRC=await fileToImageData(fs[0]); $('#status').innerHTML=`<b>${SRC.name}</b> — ${SRC.width}×${SRC.height}`;
+  $('#controls').style.display='';$('#result').style.display='';run(); });
+
+function boxBlur(L,W,H,r){const tmp=new Float32Array(W*H),out=new Float32Array(W*H),inv=1/(2*r+1);
+  for(let y=0;y<H;y++){let acc=0;const o=y*W;for(let x=-r;x<=r;x++)acc+=L[o+clamp(x,0,W-1)];for(let x=0;x<W;x++){tmp[o+x]=acc*inv;acc+=L[o+clamp(x+r+1,0,W-1)]-L[o+clamp(x-r,0,W-1)];}}
+  for(let x=0;x<W;x++){let acc=0;for(let y=-r;y<=r;y++)acc+=tmp[clamp(y,0,H-1)*W+x];for(let y=0;y<H;y++){out[y*W+x]=acc*inv;acc+=tmp[clamp(y+r+1,0,H-1)*W+x]-tmp[clamp(y-r,0,H-1)*W+x];}}return out;}
+function detect(size){ const {width:W,height:H}=SRC,m=MAPS[size],T=size,A=m.a;
+  const L=lumOf(SRC.data),B=boxBlur(L,W,H,Math.round(T*0.75)),Hp=new Float32Array(W*H);
+  for(let i=0;i<Hp.length;i++)Hp[i]=L[i]-B[i];
+  const score=(ox,oy)=>{ if(ox<0||oy<0||ox+T>W||oy+T>H)return -2; let sH=0,sHH=0,sAH=0,n=T*T;
+    for(let y=0;y<T;y++){const row=(oy+y)*W+ox,ar=y*T;for(let x=0;x<T;x++){const h=Hp[row+x],a=A[ar+x];sH+=h;sHH+=h*h;sAH+=a*h;}}
+    const num=sAH-m.mean*sH,den=Math.sqrt(m.varsum*(sHH-sH*sH/n));return den>1e-6?num/den:-2; };
+  const corners=[['br',W-T,H-T,-1,-1],['bl',0,H-T,1,-1],['tr',W-T,0,-1,1],['tl',0,0,1,1]]; let best={ncc:-2};
+  for(const [name,bx,by,sx,sy] of corners)for(let mg=4;mg<=Math.min(240,Math.floor(Math.min(W,H)/2-T));mg+=2){const ox=bx+sx*mg,oy=by+sy*mg,ncc=score(ox,oy);if(ncc>best.ncc)best={ncc,ox,oy,corner:name};}
+  if(best.ncc<=-2)return null;
+  for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){const ox=best.ox+dx,oy=best.oy+dy,ncc=score(ox,oy);if(ncc>best.ncc)best={...best,ncc,ox,oy};}
+  best.size=size;return best; }
+function removeAt(size,ox,oy,W255,strength){ const {width:W,height:H}=SRC,T=size,A=MAPS[size].a;
+  const out=new ImageData(new Uint8ClampedArray(SRC.data.data),W,H),d=out.data,s=SRC.data.data;
+  for(let y=0;y<T;y++){const gy=oy+y;if(gy<0||gy>=H)continue;for(let x=0;x<T;x++){const gx=ox+x;if(gx<0||gx>=W)continue;
+    let a=A[y*T+x]*strength;if(a<=0.002)continue;if(a>0.98)a=0.98;const inv=1-a,i=(gy*W+gx)*4;
+    d[i]=clamp((s[i]-W255[0]*a)/inv,0,255);d[i+1]=clamp((s[i+1]-W255[1]*a)/inv,0,255);d[i+2]=clamp((s[i+2]-W255[2]*a)/inv,0,255);}}
+  return out; }
+function run(){ if(!SRC)return; const size=pickSize(); if(size==null)return;
+  const sel=$('#corner').value; let ox,oy,corner,ncc=null;
+  if(sel==='auto'){ const det=detect(size); if(!det){$('#detinfo').textContent='Could not locate the watermark.';return;} ({ox,oy,corner,ncc}=det); }
+  else { const T=size,W=SRC.width,H=SRC.height,m=(W>=1024&&H>=1024)?64:32; const map={br:[W-T-m,H-T-m],bl:[m,H-T-m],tr:[W-T-m,m],tl:[m,m]};[ox,oy]=map[sel];corner=sel; }
+  ox+=+$('#nudgeX').value||0; oy+=+$('#nudgeY').value||0;
+  const c=$('#wcolor').value,W255=[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
+  const out=removeAt(size,ox,oy,W255,(+$('#strength').value)/100); LAST={out,ox,oy,size};
+  $('#detinfo').innerHTML=`Region <span class="badge ok">${size}×${size}</span> at <b>${corner}</b> (${ox},${oy})`+(ncc!=null?` · match <b>${ncc.toFixed(2)}</b>${ncc<0.12?' <span class="badge bad">low — adjust manually</span>':''}`:' · manual');
+  render(); }
+function render(){ if(!LAST)return; const img=$('#before').checked?SRC.data:LAST.out,cv=$('#cv'),T=LAST.size;
+  if($('#zoom').checked){ const pad=Math.round(T*0.6); let x0=clamp(LAST.ox-pad,0,SRC.width),y0=clamp(LAST.oy-pad,0,SRC.height),x1=clamp(LAST.ox+T+pad,0,SRC.width),y1=clamp(LAST.oy+T+pad,0,SRC.height);
+    const w=x1-x0,h=y1-y0,tmp=document.createElement('canvas');tmp.width=SRC.width;tmp.height=SRC.height;tmp.getContext('2d').putImageData(img,0,0);
+    cv.width=w;cv.height=h;const x=cv.getContext('2d');x.imageSmoothingEnabled=false;x.drawImage(tmp,x0,y0,w,h,0,0,w,h);
+    if($('#outline').checked){x.strokeStyle='#3b82f6';x.lineWidth=2;x.strokeRect(LAST.ox-x0,LAST.oy-y0,T,T);}
+  } else { cv.width=img.width;cv.height=img.height;const x=cv.getContext('2d');x.putImageData(img,0,0);
+    if($('#outline').checked){x.strokeStyle='#3b82f6';x.lineWidth=Math.max(1,cv.width/400);x.strokeRect(LAST.ox,LAST.oy,T,T);} } }
+$('#run').onclick=run;
+['corner','nudgeX','nudgeY','wcolor','strength'].forEach(id=>$('#'+id).addEventListener('input',()=>{if(id==='strength'){$('#sv').textContent=$('#strength').value+'%';try{localStorage.setItem('wmStrength',$('#strength').value);}catch(e){}}run();}));
+function restoreStrength(){ try{const v=localStorage.getItem('wmStrength'); if(v){$('#strength').value=v;$('#sv').textContent=v+'%';}}catch(e){} }
+['outline','before','zoom'].forEach(id=>$('#'+id).addEventListener('change',render));
+$('#dl').onclick=()=>{const c=document.createElement('canvas');c.width=LAST.out.width;c.height=LAST.out.height;c.getContext('2d').putImageData(LAST.out,0,0);const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download=(SRC.name||'image').replace(/\.\w+$/,'')+'-clean.png';a.click();};
+
+/* init */
+restore(); if(!Object.keys(MAPS).length)loadDefault(); restoreStrength(); refreshActive(); { const k=Object.keys(MAPS)[0]; if(k)showProfile(+k); }
+</script>
+</body>
+</html>

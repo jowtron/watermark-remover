@@ -1,0 +1,4 @@
+.DS_Store
+*.zip
+# local-only: the build that embeds a third party's extracted data — never published
+gemini-watermark-remover.html
