@@ -28,6 +28,7 @@
   .ok{ color:var(--good); border-color:#1f7a3f } .bad{ color:var(--warn); border-color:#7a5a1f }
   code{ background:#0008; padding:1px 5px; border-radius:5px } details{ margin-top:10px } summary{ cursor:pointer; color:var(--mut) }
   .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:14px }
+  .caphint{ min-height:2.6em; display:block }
 </style>
 </head>
 <body>
@@ -50,8 +51,8 @@
     <b>Active watermark profile</b> <span id="profSource" class="badge ok"></span>
     <p class="hint" id="profExplain" style="margin:6px 0 0"></p>
     <div class="grid2" style="margin-top:12px; max-width:560px">
-      <div><div class="hint">Opacity map — light = where the mark is solid</div><canvas id="alphaCv"></canvas></div>
-      <div><div class="hint">How it looks composited (semi-transparent over a checker)</div><canvas id="wmCv"></canvas></div>
+      <div><div class="hint caphint">Opacity map — light = solid areas</div><canvas id="alphaCv"></canvas></div>
+      <div><div class="hint caphint">Composited over a checkerboard</div><canvas id="wmCv"></canvas></div>
     </div>
     <div class="small" id="profMeta" style="margin-top:10px"></div>
     <div style="margin-top:10px">
