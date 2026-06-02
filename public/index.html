@@ -37,22 +37,40 @@
 </header>
 
 <div class="tabs">
-  <div class="tab active" data-tab="learn">1 · Learn watermark</div>
+  <div class="tab active" data-tab="learn">1 · Watermark</div>
   <div class="tab" data-tab="remove">2 · Remove</div>
   <div class="tab" data-tab="about">How it works</div>
 </div>
 
 <main>
-<!-- ===================== LEARN ===================== -->
+<!-- ===================== WATERMARK PROFILE ===================== -->
 <section id="learn">
+  <!-- active profile (built-in Gemini by default) shown first -->
+  <div class="panel" id="profPanel" style="display:none">
+    <b>Active watermark profile</b> <span id="profSource" class="badge ok"></span>
+    <p class="hint" id="profExplain" style="margin:6px 0 0"></p>
+    <div class="grid2" style="margin-top:12px; max-width:560px">
+      <div><div class="hint">Opacity map — light = where the mark is solid</div><canvas id="alphaCv"></canvas></div>
+      <div><div class="hint">How it looks composited (semi-transparent over a checker)</div><canvas id="wmCv"></canvas></div>
+    </div>
+    <div class="small" id="profMeta" style="margin-top:10px"></div>
+    <div style="margin-top:10px">
+      <button id="saveProf">Download profile JSON</button>
+      <button id="loadProfBtn">Load profile JSON…</button>
+      <input type="file" id="profFile" accept="application/json,.json" hidden>
+      <span class="hint">This is what the Remove tab will erase. Saved in this browser automatically.</span>
+    </div>
+  </div>
+
+  <!-- optional: teach a different watermark -->
   <div class="panel">
-    <b>Learn the watermark from a batch of images</b>
-    <p class="hint">Drop <b>~20–60 different watermarked images</b> that all carry the <b>same</b> watermark in the <b>same corner</b> (e.g. a folder of Gemini outputs). More images = cleaner result. The watermark is the one consistent thing across them, so it can be recovered statistically while the varied picture content cancels out.</p>
-    <div class="drop" id="learnDrop">Drop watermarked images here, or click</div>
+    <b>Teach a different watermark</b> <span class="badge">optional</span>
+    <p class="hint">The Gemini ✦ mark is already built in (above), so for Gemini images you can skip straight to the <b>Remove</b> tab. Use this only to remove a <i>different</i> fixed watermark: drop <b>~20–60 images</b> that all carry the same mark in the same corner, and the tool measures it statistically — the watermark is the one thing common to every image, so the varied picture content cancels out. No clean originals or labelling needed.</p>
+    <div class="drop" id="learnDrop">Drop ~20+ watermarked images here, or click</div>
     <input type="file" id="learnFiles" accept="image/*" multiple hidden>
     <div class="row" style="margin-top:12px">
       <div class="col">
-        <label>Corner</label>
+        <label>Corner the mark sits in</label>
         <select id="learnCorner"><option value="br">Bottom-right</option><option value="bl">Bottom-left</option><option value="tr">Top-right</option><option value="tl">Top-left</option></select>
       </div>
       <div class="col">
@@ -60,25 +78,11 @@
         <select id="learnSize"><option value="auto">Auto (96 if image ≥1024, else 48)</option><option value="96">96 px</option><option value="48">48 px</option></select>
       </div>
       <div class="col" style="flex:0 0 auto">
-        <button class="primary" id="learnBtn" disabled>Learn watermark</button>
+        <button class="primary" id="learnBtn" disabled>Learn &amp; replace profile</button>
       </div>
     </div>
     <div class="small" id="learnStatus" style="margin-top:10px"></div>
-  </div>
-
-  <div class="panel" id="profPanel" style="display:none">
-    <b>Learned profile</b>
-    <div class="grid2" style="margin-top:10px">
-      <div><div class="hint">Recovered α (opacity) — white = opaque</div><canvas id="alphaCv"></canvas></div>
-      <div><div class="hint">Watermark preview (over dark)</div><canvas id="wmCv"></canvas></div>
-    </div>
-    <div class="small" id="profMeta" style="margin-top:10px"></div>
-    <div style="margin-top:10px">
-      <button id="saveProf">Download profile JSON</button>
-      <button id="loadProfBtn">Load profile JSON…</button>
-      <input type="file" id="profFile" accept="application/json,.json" hidden>
-      <span class="hint">Saved in this browser automatically.</span>
-    </div>
+    <p class="hint" style="margin:8px 0 0">Learning replaces the active profile above. To get the built-in Gemini one back, just reopen the page in a fresh tab or clear site data.</p>
   </div>
 </section>
 
@@ -133,6 +137,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelect
 
 /* learned profiles, keyed by size; each = {size, mean, varsum, a:Float32Array} */
 const MAPS={};
+let PROFILE_SRC={label:'Built-in: Gemini ✦ star', explain:'Measured from a real Gemini image — nothing to set up. For Gemini images just go to the Remove tab.'};
 function setMap(size,a){ let s=0,ss=0; for(const v of a){s+=v;ss+=v*v;} MAPS[size]={size,a,mean:s/a.length,varsum:ss-s*s/a.length}; }
 /* built-in default 96px Gemini-star profile, measured from a real watermarked image
    (harmonic-inpaint + white-alpha matting). Lets the tool work on first load; the Learn
@@ -189,6 +194,7 @@ $('#learnBtn').onclick=()=>{
   for(let y=0;y<T;y++)for(let x=0;x<T;x++){ const v=P[(best.y+y)*CROP+(best.x+x)]; a[y*T+x]=clamp((v-Pbg)/(255-Pbg),0,1); }
   setMap(size,a);
   persist();
+  PROFILE_SRC={label:`Learned from ${N} images`, explain:`Measured from your ${N} images (${corner} corner). This replaced the built-in Gemini profile.`};
   showProfile(size);
   let peak=0,foot=0; for(const v of a){ if(v>peak)peak=v; if(v>0.02)foot++; }
   $('#learnStatus').innerHTML=`Learned <b>${T}×${T}</b> watermark in <b>${corner}</b> from ${N} images · peak α ${peak.toFixed(2)} · footprint ${foot}px`;
@@ -197,11 +203,17 @@ $('#learnBtn').onclick=()=>{
 
 function showProfile(size){
   const m=MAPS[size], T=size; $('#profPanel').style.display='';
+  // left: opacity map (white = opaque)
   const aImg=new ImageData(T,T); for(let i=0,k=0;i<aImg.data.length;i+=4,k++){const a=m.a[k]*255;aImg.data[i]=aImg.data[i+1]=aImg.data[i+2]=a;aImg.data[i+3]=255;}
-  const c1=$('#alphaCv');c1.width=T;c1.height=T;c1.getContext('2d').putImageData(aImg,0,0);
+  const c1=$('#alphaCv');c1.width=T;c1.height=T;c1.style.cssText='width:150px;height:150px;image-rendering:pixelated';c1.getContext('2d').putImageData(aImg,0,0);
+  // right: watermark composited over a checkerboard so its semi-transparency is visible
+  const c2=$('#wmCv');c2.width=T;c2.height=T;c2.style.cssText='width:150px;height:150px;image-rendering:pixelated';const x2=c2.getContext('2d');
+  for(let y=0;y<T;y+=8)for(let x=0;x<T;x+=8){ x2.fillStyle=((((x>>3)+(y>>3))&1)?'#414a5a':'#262d3a'); x2.fillRect(x,y,8,8); }
   const wImg=new ImageData(T,T); for(let i=0,k=0;i<wImg.data.length;i+=4,k++){wImg.data[i]=wImg.data[i+1]=wImg.data[i+2]=255;wImg.data[i+3]=m.a[k]*255;}
-  const c2=$('#wmCv');c2.width=T;c2.height=T;c2.getContext('2d').putImageData(wImg,0,0);
-  $('#profMeta').textContent=`size ${T}×${T}`;
+  const tmp=document.createElement('canvas');tmp.width=T;tmp.height=T;tmp.getContext('2d').putImageData(wImg,0,0);x2.drawImage(tmp,0,0);
+  let peak=0;for(const v of m.a)if(v>peak)peak=v;
+  $('#profMeta').innerHTML=`${T}×${T} · peak opacity ${Math.round(peak*100)}% · colour white`;
+  $('#profSource').textContent=PROFILE_SRC.label; $('#profExplain').textContent=PROFILE_SRC.explain;
 }
 
 /* persistence */
@@ -213,13 +225,14 @@ $('#loadProfBtn').onclick=()=>$('#profFile').click();
 $('#profFile').onchange=async()=>{ const f=$('#profFile').files[0]; if(!f)return; const o=JSON.parse(await f.text());
   for(const k in o){ if(!Number.isFinite(+k)||!Array.isArray(o[k]))continue; const a=new Float32Array(o[k].length); for(let i=0;i<a.length;i++)a[i]=o[k][i]/255; setMap(+k,a); } persist();
   if(o.calibration){ $('#strength').value=o.calibration; $('#sv').textContent=o.calibration+'%'; try{localStorage.setItem('wmStrength',o.calibration);}catch(e){} }
-  const sz=Object.keys(MAPS)[0]; showProfile(+sz); refreshActive(); $('#learnStatus').textContent='Profile loaded.'; };
+  PROFILE_SRC={label:'Loaded from file', explain:'Imported from a profile JSON. This replaced the built-in Gemini profile.'};
+  const sz=Object.keys(MAPS).map(Number).filter(Number.isFinite)[0]; showProfile(sz); refreshActive(); $('#learnStatus').textContent='Profile loaded.'; };
 
 /* ================= REMOVE (same engine as the baked tool) ================= */
 let SRC=null,LAST=null;
 function refreshActive(){ const sizes=Object.keys(MAPS).filter(s=>Number.isFinite(+s)); const b=$('#activeProf');
-  if(sizes.length){ b.className='badge ok'; b.textContent=sizes.map(s=>s+'px').join(', ')+' profile ready'; }
-  else { b.className='badge bad'; b.textContent='none — learn one first'; }
+  if(sizes.length){ b.className='badge ok'; b.textContent=PROFILE_SRC.label+' · '+sizes.map(s=>s+'px').join(', '); }
+  else { b.className='badge bad'; b.textContent='none — set one on the Watermark tab'; }
 }
 function pickSize(){ const sizes=Object.keys(MAPS).map(Number).filter(Number.isFinite); if(!sizes.length)return null;
   if(SRC){ const want=(SRC.width>=1024&&SRC.height>=1024)?96:48; if(MAPS[want])return want; } return sizes[0]; }
@@ -270,7 +283,10 @@ function restoreStrength(){ try{const v=localStorage.getItem('wmStrength'); if(v
 $('#dl').onclick=()=>{const c=document.createElement('canvas');c.width=LAST.out.width;c.height=LAST.out.height;c.getContext('2d').putImageData(LAST.out,0,0);const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download=(SRC.name||'image').replace(/\.\w+$/,'')+'-clean.png';a.click();};
 
 /* init */
-restore(); if(!Object.keys(MAPS).length)loadDefault(); restoreStrength(); refreshActive(); { const k=Object.keys(MAPS)[0]; if(k)showProfile(+k); }
+restore();
+if(!Object.keys(MAPS).length){ loadDefault(); }
+else { PROFILE_SRC={label:'Saved in this browser', explain:'Your saved profile. Open in a fresh/incognito tab (or clear site data) to restore the built-in Gemini ✦ profile.'}; }
+restoreStrength(); refreshActive(); { const k=Object.keys(MAPS).map(Number).filter(Number.isFinite)[0]; if(k!=null)showProfile(k); }
 </script>
 </body>
 </html>
