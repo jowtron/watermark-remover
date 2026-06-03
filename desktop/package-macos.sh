@@ -18,14 +18,33 @@ DIST="dist"
 APP="$DIST/$APP_NAME.app"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
 
-echo "▶ building release binary (v$VERSION)…"
-cargo build --release
+echo "▶ building universal release binary (v$VERSION)…"
+TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
+BUILT=()
+for t in "${TARGETS[@]}"; do
+  rustup target add "$t" >/dev/null 2>&1 || true
+  if cargo build --release --target "$t"; then
+    BUILT+=("target/$t/release/$BIN_NAME")
+  else
+    echo "  ! build failed for $t — skipping"
+  fi
+done
+UNIBIN="target/universal-$BIN_NAME"
+if [[ ${#BUILT[@]} -ge 2 ]]; then
+  lipo -create -output "$UNIBIN" "${BUILT[@]}"
+  echo "  lipo: $(lipo -archs "$UNIBIN")"
+elif [[ ${#BUILT[@]} -eq 1 ]]; then
+  cp "${BUILT[0]}" "$UNIBIN"
+  echo "  single-arch only: $(lipo -archs "$UNIBIN")"
+else
+  echo "no targets built"; exit 1
+fi
 
 echo "▶ assembling bundle…"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "target/release/$BIN_NAME" "$APP/Contents/MacOS/$BIN_NAME"
+cp "$UNIBIN" "$APP/Contents/MacOS/$BIN_NAME"
 chmod +x "$APP/Contents/MacOS/$BIN_NAME"
 
 # .icns from the 1024px master, via a temporary .iconset
