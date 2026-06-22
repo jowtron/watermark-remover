@@ -234,8 +234,8 @@
 <!-- ===================== ABOUT ===================== -->
 <section id="about" style="display:none">
   <div class="panel small" style="color:var(--mut)">
-    <b style="color:var(--txt)">Why this is clean-room</b>
-    <p>Nothing here is taken from any watermark-removal product. The watermark profile is measured from <i>your own</i> images using a published, generic statistical idea:</p>
+    <b style="color:var(--txt)">How it works</b>
+    <p>The watermark profile is measured from <i>your own</i> images using a simple statistical idea:</p>
     <ul>
       <li><b>Learning.</b> The watermark is a fixed, mostly-white overlay added the same way to every image: <code>observed = original·(1−α) + 255·α</code>. Across many varied images, at each watermark pixel the darkest observed values occur when the underlying picture is dark there, so the low percentile of observed luminance ≈ <code>255·α</code>. Taking a low percentile per pixel across the batch (and subtracting the surrounding background level) recovers α directly; picture content, being different in every image, cancels out.</li>
       <li><b>Removal.</b> With α known, the composite is reversed exactly: <code>original = (observed − 255·α)/(1−α)</code>. The watermark's position in each new image is found by correlating the learned α-shape against the local brightening.</li>
