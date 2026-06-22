@@ -4,6 +4,18 @@ All notable changes to the Watermark Remover (web tool + Rust desktop app) are
 documented here. Format based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — web app
+
+### Added
+- **Batch mode.** Drop multiple images on the Remove tab to clean them all
+  in-browser and **download the results as a single ZIP** (store-only writer, no
+  dependencies). Click any result to open it in the single-image editor.
+
+### Changed
+- **Redesigned the web page** — modern hero, segmented tabs, an icon feature
+  grid, and refined cards/controls, with automatic **light/dark theme** that
+  follows the visitor's system preference.
+
 ## [0.2.0] — 2026-06-22
 
 ### Changed

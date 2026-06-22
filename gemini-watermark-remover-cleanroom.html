@@ -24,47 +24,128 @@
 <meta name="twitter:description" content="Erase the Gemini watermark from images right in your browser. No upload, no sign-up.">
 <meta name="twitter:image" content="https://watermarkremover.jderrick.app/og.png">
 <style>
-  :root{ --bg:#0e1117; --panel:#161b22; --line:#2b3240; --txt:#e6edf3; --mut:#9aa6b2; --accent:#3b82f6; --good:#22c55e; --warn:#f59e0b; }
-  *{ box-sizing:border-box } body{ margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt) }
-  header{ padding:18px 22px; border-bottom:1px solid var(--line) } h1{ font-size:18px; margin:0 }
-  header p{ margin:4px 0 0; color:var(--mut); font-size:12.5px }
-  .tabs{ display:flex; gap:6px; padding:12px 22px 0 }
-  .tab{ padding:8px 14px; border:1px solid var(--line); border-bottom:none; border-radius:8px 8px 0 0; cursor:pointer; background:var(--panel); color:var(--mut) }
-  .tab.active{ color:var(--txt); background:var(--bg); border-color:var(--accent); border-bottom:1px solid var(--bg); margin-bottom:-1px }
-  main{ padding:18px 22px; max-width:1080px }
-  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px }
+  /* Light theme by default; dark via the visitor's system preference. */
+  :root{
+    --bg:#f5f6f8; --bg2:#eceef2; --panel:#ffffff; --line:#e3e6eb; --line2:#d3d8e0;
+    --txt:#161c26; --mut:#5d6775; --accent:#2563eb; --accent2:#7c3aed;
+    --good:#15803d; --good-bd:#bbf7d0; --warn:#b45309; --warn-bd:#fde68a;
+    --chip:#f1f3f7; --shadow:0 1px 2px rgba(20,30,50,.06),0 8px 24px rgba(20,30,50,.06);
+    --grad:linear-gradient(135deg,#2563eb,#7c3aed);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0c0f15; --bg2:#11151d; --panel:#161b22; --line:#262d39; --line2:#323a48;
+      --txt:#e6edf3; --mut:#9aa6b2; --accent:#5b8cff; --accent2:#a78bfa;
+      --good:#4ade80; --good-bd:#1f5135; --warn:#fbbf24; --warn-bd:#5a4318;
+      --chip:#1c222c; --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+      --grad:linear-gradient(135deg,#6ea0ff,#b89bff);
+    }
+  }
+  *{ box-sizing:border-box }
+  html{ scroll-behavior:smooth }
+  body{ margin:0; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--txt); -webkit-font-smoothing:antialiased }
+  a{ color:var(--accent); text-decoration:none } a:hover{ text-decoration:underline }
+  .wrap{ max-width:1080px; margin:0 auto; padding:0 22px }
+
+  /* top bar */
+  .nav{ display:flex; align-items:center; gap:10px; padding:16px 0 }
+  .brand{ display:flex; align-items:center; gap:10px; font-weight:700; font-size:15px }
+  .brand .spark{ width:26px; height:26px; border-radius:8px; background:var(--grad); display:grid; place-items:center }
+  .brand .spark svg{ width:15px; height:15px; color:#fff }
+  .nav .spacer{ flex:1 }
+  .pill{ font-size:12px; color:var(--mut); border:1px solid var(--line); border-radius:99px; padding:5px 11px; background:var(--panel) }
+
+  /* hero */
+  .hero{ text-align:center; padding:30px 0 8px }
+  .hero h1{ font-size:clamp(28px,5vw,44px); line-height:1.1; margin:0 0 14px; letter-spacing:-.02em; font-weight:800 }
+  .hero h1 .g{ background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent }
+  .hero p{ font-size:clamp(15px,2.2vw,18px); color:var(--mut); max-width:620px; margin:0 auto 18px }
+  .hero .chips{ display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-bottom:8px }
+  .chip{ font-size:12.5px; color:var(--mut); background:var(--chip); border:1px solid var(--line); border-radius:99px; padding:5px 12px }
+
+  /* segmented tabs */
+  .tabs{ display:inline-flex; gap:4px; padding:4px; margin:24px auto 18px; background:var(--bg2);
+    border:1px solid var(--line); border-radius:12px }
+  .tabsWrap{ display:flex; justify-content:center }
+  .tab{ padding:8px 16px; border-radius:9px; cursor:pointer; color:var(--mut); font-weight:600; font-size:13.5px; border:1px solid transparent; transition:.15s }
+  .tab:hover{ color:var(--txt) }
+  .tab.active{ color:var(--txt); background:var(--panel); border-color:var(--line); box-shadow:var(--shadow) }
+
+  /* cards / controls */
+  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px; box-shadow:var(--shadow) }
   .row{ display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end } .col{ flex:1; min-width:150px }
-  label{ display:block; font-size:12px; color:var(--mut); margin:0 0 4px }
-  select,input[type=number],input[type=color]{ width:100%; padding:7px 8px; background:var(--bg); border:1px solid var(--line); border-radius:7px; color:var(--txt) }
-  input[type=range]{ width:100% }
-  button{ padding:9px 14px; border:1px solid var(--line); background:#21283280; color:var(--txt); border-radius:8px; cursor:pointer; font-weight:600 }
-  button.primary{ background:var(--accent); border-color:var(--accent); color:#fff } button:disabled{ opacity:.45; cursor:not-allowed }
-  .drop{ border:1.5px dashed var(--line); border-radius:10px; padding:26px; text-align:center; color:var(--mut); cursor:pointer; transition:.15s }
-  .drop:hover,.drop.over{ border-color:var(--accent); color:var(--txt) }
-  canvas{ max-width:100%; border:1px solid var(--line); border-radius:8px; background:#0008 }
-  .hint{ font-size:12px; color:var(--mut) } .small{ font-size:12px }
-  .badge{ font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid var(--line) }
-  .ok{ color:var(--good); border-color:#1f7a3f } .bad{ color:var(--warn); border-color:#7a5a1f }
-  code{ background:#0008; padding:1px 5px; border-radius:5px } details{ margin-top:10px } summary{ cursor:pointer; color:var(--mut) }
+  label{ display:block; font-size:12px; color:var(--mut); margin:0 0 5px; font-weight:500 }
+  select,input[type=number],input[type=color]{ width:100%; padding:9px 10px; background:var(--bg); border:1px solid var(--line2); border-radius:9px; color:var(--txt); font:inherit; font-size:14px }
+  select:focus,input:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent) }
+  input[type=color]{ padding:4px; height:38px }
+  input[type=range]{ width:100%; accent-color:var(--accent) }
+  button{ padding:10px 16px; border:1px solid var(--line2); background:var(--panel); color:var(--txt); border-radius:10px; cursor:pointer; font-weight:600; font-size:14px; font-family:inherit; transition:.12s }
+  button:hover{ border-color:var(--accent) }
+  button.primary{ background:var(--accent); border-color:var(--accent); color:#fff }
+  button.primary:hover{ filter:brightness(1.08) }
+  button:disabled{ opacity:.45; cursor:not-allowed }
+  .drop{ border:1.5px dashed var(--line2); border-radius:14px; padding:34px 26px; text-align:center; color:var(--mut); cursor:pointer; transition:.15s; background:var(--bg) }
+  .drop:hover,.drop.over{ border-color:var(--accent); color:var(--txt); background:color-mix(in srgb,var(--accent) 5%,var(--bg)) }
+  .drop b{ color:var(--txt) }
+  canvas{ max-width:100%; border:1px solid var(--line); border-radius:10px; background:var(--bg2) }
+  .hint{ font-size:12.5px; color:var(--mut) } .small{ font-size:13px }
+  .badge{ font-size:11px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--mut); display:inline-block }
+  .ok{ color:var(--good); border-color:var(--good-bd); background:color-mix(in srgb,var(--good) 9%,transparent) }
+  .bad{ color:var(--warn); border-color:var(--warn-bd); background:color-mix(in srgb,var(--warn) 9%,transparent) }
+  code{ background:var(--chip); padding:1.5px 6px; border-radius:6px; font-size:.9em } details{ margin-top:10px } summary{ cursor:pointer; color:var(--mut) }
   .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:14px }
   .caphint{ min-height:2.6em; display:block }
+  h2.sec{ text-align:center; font-size:26px; letter-spacing:-.02em; margin:46px 0 6px }
+  .sec-sub{ text-align:center; color:var(--mut); margin:0 0 26px }
+
+  /* feature grid */
+  .features{ display:grid; grid-template-columns:repeat(3,1fr); gap:18px 28px; margin:0 0 20px }
+  @media (max-width:820px){ .features{ grid-template-columns:repeat(2,1fr) } }
+  @media (max-width:560px){ .features{ grid-template-columns:1fr } .grid2{ grid-template-columns:1fr } }
+  .feat{ display:flex; gap:14px }
+  .feat .ic{ flex:0 0 auto; width:40px; height:40px; border-radius:11px; background:var(--chip); border:1px solid var(--line); display:grid; place-items:center; color:var(--accent) }
+  .feat .ic svg{ width:20px; height:20px }
+  .feat h3{ margin:2px 0 4px; font-size:15.5px }
+  .feat p{ margin:0; color:var(--mut); font-size:13.5px; line-height:1.5 }
+
+  /* batch results */
+  .bgrid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:14px; margin-top:14px }
+  .bcard{ border:1px solid var(--line); border-radius:11px; overflow:hidden; background:var(--bg); cursor:pointer; transition:.12s }
+  .bcard:hover{ border-color:var(--accent); transform:translateY(-1px) }
+  .bcard canvas{ width:100%; display:block; border:none; border-radius:0; aspect-ratio:1; object-fit:cover; background:var(--bg2) }
+  .bcard .meta{ padding:8px 9px }
+  .bcard .nm{ font-size:11.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .bbar{ display:flex; align-items:center; gap:12px; flex-wrap:wrap }
+
+  footer{ border-top:1px solid var(--line); margin-top:40px; padding:24px 0 40px; color:var(--mut); font-size:13px; text-align:center }
 </style>
 </head>
 <body>
-<header>
-  <h1>Watermark Remover — clean-room <span class="hint">self-learning, in-browser</span></h1>
-  <p>Ships with a Gemini-star profile measured from a real watermarked image (harmonic inpaint + alpha-matting) — works out of the box. The Learn tab can re-derive any watermark from a batch of your own images (no clean originals, no labeling, no third-party data).</p>
-</header>
+<div class="wrap">
+  <nav class="nav">
+    <span class="brand"><span class="spark"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1C13 7 17 11 23 12C17 13 13 17 12 23C11 17 7 13 1 12C7 11 11 7 12 1Z"/></svg></span> Watermark Remover</span>
+    <span class="spacer"></span>
+    <span class="pill">No upload · runs in your browser</span>
+  </nav>
 
-<div class="tabs">
-  <div class="tab active" data-tab="learn">1 · Watermark</div>
-  <div class="tab" data-tab="remove">2 · Remove</div>
-  <div class="tab" data-tab="about">How it works</div>
-</div>
+  <section class="hero">
+    <h1>Erase the <span class="g">Gemini watermark</span><br>right in your browser</h1>
+    <p>Drop an image and the ✦ mark is reversed out exactly — no AI repaint, no upload, no sign-up. Handles Gemini &amp; Nano Banana marks at every resolution, and can learn any other fixed watermark.</p>
+    <div class="chips">
+      <span class="chip">100% local</span><span class="chip">Lossless PNG</span><span class="chip">Batch → ZIP</span><span class="chip">Free, no sign-up</span>
+    </div>
+  </section>
+
+  <div class="tabsWrap"><div class="tabs">
+    <div class="tab active" data-tab="remove">Remove</div>
+    <div class="tab" data-tab="learn">Watermark profile</div>
+    <div class="tab" data-tab="about">How it works</div>
+  </div></div>
 
 <main>
 <!-- ===================== WATERMARK PROFILE ===================== -->
-<section id="learn">
+<section id="learn" style="display:none">
   <!-- active profile (built-in Gemini by default) shown first -->
   <div class="panel" id="profPanel" style="display:none">
     <b>Active watermark profile</b> <span id="profSource" class="badge ok"></span>
@@ -107,12 +188,25 @@
 </section>
 
 <!-- ===================== REMOVE ===================== -->
-<section id="remove" style="display:none">
-  <div class="panel"><b>Active profile:</b> <span id="activeProf" class="badge bad">none — learn one first</span></div>
+<section id="remove">
+  <div class="panel" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <b>Active profile</b> <span id="activeProf" class="badge bad">none — set one on the Watermark tab</span>
+    <span class="hint" style="margin-left:auto">Gemini ✦ is built in — just drop an image.</span>
+  </div>
   <div class="panel">
-    <div class="drop" id="drop">Drop a watermarked image here, or click</div>
-    <input type="file" id="file" accept="image/*" hidden>
+    <div class="drop" id="drop"><b>Drop image(s) here</b>, or click<div class="hint" style="margin-top:6px">one to fine-tune · many for batch → ZIP</div></div>
+    <input type="file" id="file" accept="image/*" multiple hidden>
     <div class="small" id="status" style="margin-top:10px"></div>
+  </div>
+  <div class="panel" id="batch" style="display:none">
+    <div class="bbar">
+      <b>Batch results</b> <span id="batchStatus" class="hint"></span>
+      <div style="flex:1"></div>
+      <button id="batchClear">Clear</button>
+      <button class="primary" id="batchZip">Download all (.zip)</button>
+    </div>
+    <div class="bgrid" id="batchGrid"></div>
+    <p class="hint" style="margin:10px 0 0">Click a result to open it in the single-image editor below for fine-tuning.</p>
   </div>
   <div class="panel" id="controls" style="display:none">
     <div class="row">
@@ -149,6 +243,43 @@
   </div>
 </section>
 </main>
+
+<section>
+  <h2 class="sec">Why it's different</h2>
+  <p class="sec-sub">Mathematically exact removal, entirely on your device.</p>
+  <div class="features">
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v4M3 5h4M6 17v4M4 19h4"/><path d="M13 3l2.4 6.6L22 12l-6.6 2.4L13 21l-2.4-6.6L4 12l6.6-2.4L13 3z"/></svg></div>
+      <div><h3>Reverse alpha-blend, not AI</h3><p>Reconstructs the exact pixels under the mark with a calibrated alpha map — no model repaint, no soft edges.</p></div>
+    </div>
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg></div>
+      <div><h3>100% browser-local</h3><p>All computation stays in your browser. Images never leave your device — zero uploads, no servers.</p></div>
+    </div>
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="1.8"/><path d="M21 15l-5-5L5 21"/></svg></div>
+      <div><h3>All formats · all resolutions</h3><p>Accepts JPG, PNG and WebP at any Gemini resolution; exports lossless PNG.</p></div>
+    </div>
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 6 4 9 10 10-6 1-9 4-10 10-1-6-4-9-10-10 6-1 9-4 10-10z"/></svg></div>
+      <div><h3>Gemini ✦ &amp; Nano Banana</h3><p>Covers the Gemini star at 96px / 48px, the 192px-margin variant, and the Nano Banana (2.5 Flash) mark — auto-located by a size catalog.</p></div>
+    </div>
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
+      <div><h3>Batch &amp; ZIP</h3><p>Drop many images, clean them all in-browser, and download the results as a single ZIP.</p></div>
+    </div>
+    <div class="feat">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></div>
+      <div><h3>Learns any watermark</h3><p>Teach a different fixed mark from a batch of your own images — it's measured statistically, no clean originals or labels needed.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  Runs entirely in your browser — nothing is uploaded.<br>
+  Clean-room alpha-unblend engine · also available as a macOS desktop app.
+</footer>
+</div><!-- /.wrap -->
 
 <script>
 "use strict";
@@ -258,9 +389,65 @@ function refreshActive(){ const sizes=Object.keys(MAPS).filter(s=>Number.isFinit
 }
 function pickSize(){ const sizes=Object.keys(MAPS).map(Number).filter(Number.isFinite); if(!sizes.length)return null;
   if(SRC){ const want=(SRC.width>=1024&&SRC.height>=1024)?96:48; if(MAPS[want])return want; } return sizes[0]; }
-wireDrop($('#drop'),$('#file'),async fs=>{ if(!fs[0])return; if(!Object.keys(MAPS).length){$('#status').innerHTML='<span class="badge bad">Learn a watermark first (tab 1).</span>';return;}
-  $('#status').textContent='Loading…'; SRC=await fileToImageData(fs[0]); $('#status').innerHTML=`<b>${SRC.name}</b> — ${SRC.width}×${SRC.height}`;
-  $('#controls').style.display='';$('#result').style.display='';run(); });
+function showSingle(){ $('#batch').style.display='none'; $('#controls').style.display=''; $('#result').style.display=''; }
+function showBatch(){ $('#batch').style.display=''; $('#controls').style.display='none'; $('#result').style.display='none'; }
+wireDrop($('#drop'),$('#file'),async fs=>{ if(!fs.length)return; if(!Object.keys(MAPS).length){$('#status').innerHTML='<span class="badge bad">Set a watermark profile first (Watermark tab).</span>';return;}
+  if(fs.length===1){ $('#status').textContent='Loading…'; SRC=await fileToImageData(fs[0]); $('#status').innerHTML=`<b>${SRC.name}</b> — ${SRC.width}×${SRC.height}`; showSingle(); run(); }
+  else { runBatch(fs); } });
+
+/* ---- batch: clean many images, download as a ZIP (all in-browser) ---- */
+let BATCH=[];
+/* run detection+removal on a loaded image (SRC-shaped {data,width,height,name}) */
+function processSrc(srcObj,strength){ const prev=SRC; SRC=srcObj;
+  let det = MAPS[96] ? detectCatalog() : detect(pickSize());
+  let out=null;
+  if(det) out=removeAt(mapForSize(det.size),det.ox,det.oy,[255,255,255],strength);
+  SRC=prev; return {out,det}; }
+function idToPngBlob(id){ return new Promise(res=>{ const c=document.createElement('canvas'); c.width=id.width;c.height=id.height; c.getContext('2d').putImageData(id,0,0); c.toBlob(b=>res(b),'image/png'); }); }
+async function runBatch(fs){ showBatch(); BATCH=[]; const grid=$('#batchGrid'); grid.innerHTML='';
+  $('#status').innerHTML=`<b>${fs.length}</b> images — batch mode`; const strength=(+$('#strength').value)/100;
+  let done=0,ok=0; $('#batchStatus').textContent=`processing 0/${fs.length}…`;
+  for(const f of fs){ let src; try{ src=await fileToImageData(f); }catch(e){ done++; continue; }
+    const {out,det}=processSrc(src,strength); if(out)ok++;
+    const entry={name:f.name||'image', src, out, det}; BATCH.push(entry);
+    // card
+    const card=document.createElement('div'); card.className='bcard';
+    const cv=document.createElement('canvas'); const id=out||src.data; const sc=Math.min(1,300/id.width);
+    cv.width=Math.round(id.width*sc); cv.height=Math.round(id.height*sc);
+    const tmp=document.createElement('canvas'); tmp.width=id.width; tmp.height=id.height; tmp.getContext('2d').putImageData(id,0,0);
+    const cx=cv.getContext('2d'); cx.imageSmoothingEnabled=true; cx.drawImage(tmp,0,0,cv.width,cv.height);
+    const meta=document.createElement('div'); meta.className='meta';
+    meta.innerHTML=`<div class="nm">${entry.name}</div>`+(det?`<span class="badge ok" style="margin-top:4px">cleaned · ${det.size}px</span>`:`<span class="badge bad" style="margin-top:4px">no mark found</span>`);
+    card.appendChild(cv); card.appendChild(meta);
+    card.title='Click to fine-tune in the single-image editor';
+    card.onclick=()=>{ SRC=entry.src; showSingle(); $('#status').innerHTML=`<b>${entry.name}</b> — ${SRC.width}×${SRC.height}`; run(); document.querySelector('#controls').scrollIntoView({behavior:'smooth',block:'nearest'}); };
+    grid.appendChild(card); done++; $('#batchStatus').textContent=`processing ${done}/${fs.length}…`;
+    await new Promise(r=>setTimeout(r,0)); // let the UI paint between images
+  }
+  $('#batchStatus').textContent=`${ok}/${fs.length} cleaned`; $('#batchZip').disabled=ok===0; }
+$('#batchClear').onclick=()=>{ BATCH=[]; $('#batchGrid').innerHTML=''; $('#batch').style.display='none'; $('#status').textContent=''; };
+$('#batchZip').onclick=async()=>{ const files=[];
+  for(const b of BATCH){ if(!b.out)continue; const blob=await idToPngBlob(b.out); const buf=new Uint8Array(await blob.arrayBuffer());
+    files.push({name:(b.name.replace(/\.[^.]+$/,''))+'-clean.png', data:buf}); }
+  if(!files.length)return; const zip=zipStore(files); const a=document.createElement('a');
+  a.href=URL.createObjectURL(zip); a.download='watermark-clean.zip'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); };
+
+/* minimal store-only (no compression) ZIP writer — PNGs are already compressed */
+const CRC_T=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0;}return t;})();
+function crc32(u8){let c=0xFFFFFFFF;for(let i=0;i<u8.length;i++)c=CRC_T[(c^u8[i])&0xFF]^(c>>>8);return (c^0xFFFFFFFF)>>>0;}
+function zipStore(files){ const enc=new TextEncoder(),chunks=[],central=[]; let off=0;
+  const u16=v=>[v&255,(v>>8)&255], u32=v=>[v&255,(v>>8)&255,(v>>16)&255,(v>>24)&255];
+  for(const f of files){ const name=enc.encode(f.name),data=f.data,crc=crc32(data);
+    const lh=[].concat(u32(0x04034b50),u16(20),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0));
+    const local=new Uint8Array(lh.length+name.length); local.set(lh,0); local.set(name,lh.length);
+    chunks.push(local,data);
+    const ch=[].concat(u32(0x02014b50),u16(20),u16(20),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(off));
+    const cen=new Uint8Array(ch.length+name.length); cen.set(ch,0); cen.set(name,ch.length); central.push(cen);
+    off+=local.length+data.length; }
+  let cenSize=0; for(const c of central)cenSize+=c.length; const cenOff=off;
+  for(const c of central){ chunks.push(c); off+=c.length; }
+  chunks.push(new Uint8Array([].concat(u32(0x06054b50),u16(0),u16(0),u16(files.length),u16(files.length),u32(cenSize),u32(cenOff),u16(0))));
+  return new Blob(chunks,{type:'application/zip'}); }
 
 function boxBlur(L,W,H,r){const tmp=new Float32Array(W*H),out=new Float32Array(W*H),inv=1/(2*r+1);
   for(let y=0;y<H;y++){let acc=0;const o=y*W;for(let x=-r;x<=r;x++)acc+=L[o+clamp(x,0,W-1)];for(let x=0;x<W;x++){tmp[o+x]=acc*inv;acc+=L[o+clamp(x+r+1,0,W-1)]-L[o+clamp(x-r,0,W-1)];}}
