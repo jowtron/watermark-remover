@@ -4,6 +4,7 @@
 // learn any other fixed watermark from a batch of images. See engine.rs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod catalog;
 mod engine;
 mod profile;
 
@@ -61,13 +62,11 @@ fn batch_main(args: &[String]) {
         let fname = p.file_name().unwrap().to_string_lossy().into_owned();
         match engine::load_image_from_path(p) {
             Ok(img) => {
-                let size = profile.pick_size(img.w, img.h).unwrap();
-                let map = profile.maps.get(&size).unwrap();
-                let lum = engine::lum_of(&img.rgba, img.w, img.h);
-                match engine::detect(&lum, img.w, img.h, map) {
+                match auto_detect(&profile, &img.rgba, img.w, img.h) {
                     Some(d) => {
+                        let map = removal_map(&profile, d.size);
                         let out =
-                            engine::remove_at(&img.rgba, img.w, img.h, map, d.ox, d.oy, [255, 255, 255], 1.0);
+                            engine::remove_at(&img.rgba, img.w, img.h, &map, d.ox, d.oy, [255, 255, 255], 1.0);
                         let stem = p.file_stem().unwrap().to_string_lossy();
                         let outp = std::path::Path::new(&outdir).join(format!("{stem}-clean.png"));
                         let _ = engine::save_png(&outp, &out, img.w, img.h);
@@ -84,6 +83,33 @@ fn batch_main(args: &[String]) {
         }
     }
     println!("\n{ok}/{} processed → {outdir}", paths.len());
+}
+
+/// Auto-locate the watermark. For the built-in Gemini profile (which has a 96px
+/// map) this validates the **size catalog**'s known anchors and removes nothing
+/// if none look like a real watermark — avoiding the false-positive corner star.
+/// A custom learned profile (no 96px map) falls back to the high-pass detector.
+fn auto_detect(profile: &Profile, rgba: &[u8], w: usize, h: usize) -> Option<engine::Detection> {
+    if let Some(base96) = profile.maps.get(&96) {
+        engine::detect_catalog(rgba, w, h, base96, &catalog::search_configs(w, h))
+    } else {
+        let size = profile.pick_size(w, h)?;
+        let map = profile.maps.get(&size)?;
+        let lum = engine::lum_of(rgba, w, h);
+        engine::detect(&lum, w, h, map)
+    }
+}
+
+/// The α-map to remove with at a given tile size: an exact baked map if present,
+/// otherwise one interpolated from the 96px base.
+fn removal_map(profile: &Profile, size: usize) -> engine::AlphaMap {
+    if let Some(m) = profile.maps.get(&size) {
+        return m.clone();
+    }
+    if let Some(base96) = profile.maps.get(&96) {
+        return engine::map_for_size(base96, size);
+    }
+    profile.maps.values().next().cloned().unwrap()
 }
 
 // ───────────────────────────── model ─────────────────────────────
@@ -487,21 +513,20 @@ impl App {
             return;
         };
         let (w, h) = (src.w, src.h);
-        let Some(size) = self.profile.pick_size(w, h) else {
+        let Some(default_size) = self.profile.pick_size(w, h) else {
             self.det_info = "No active profile.".into();
             return;
         };
-        let map = self.profile.maps.get(&size).unwrap();
 
-        let (mut ox, mut oy, corner, ncc);
+        let (mut ox, mut oy, corner, ncc, used_size);
         if self.corner_sel == CornerSel::Auto {
-            let lum = engine::lum_of(&src.rgba, w, h);
-            match engine::detect(&lum, w, h, map) {
+            match auto_detect(&self.profile, &src.rgba, w, h) {
                 Some(d) => {
                     ox = d.ox;
                     oy = d.oy;
                     corner = d.corner.to_string();
                     ncc = Some(d.ncc);
+                    used_size = d.size;
                 }
                 None => {
                     self.det_info = "Could not locate the watermark — pick a corner manually.".into();
@@ -509,7 +534,7 @@ impl App {
                 }
             }
         } else {
-            let t = size as i64;
+            let t = default_size as i64;
             let m = if w >= 1024 && h >= 1024 { 64i64 } else { 32 };
             let (wi, hi) = (w as i64, h as i64);
             let (a, b) = match self.corner_sel {
@@ -523,24 +548,26 @@ impl App {
             oy = b;
             corner = self.corner_sel.code().to_string();
             ncc = None;
+            used_size = default_size;
         }
         ox += self.nudge_x.trim().parse::<i64>().unwrap_or(0);
         oy += self.nudge_y.trim().parse::<i64>().unwrap_or(0);
         let color = parse_hex(&self.color_hex).unwrap_or([255, 255, 255]);
         let strength = self.strength as f32 / 100.0;
-        let out = engine::remove_at(&src.rgba, w, h, map, ox, oy, color, strength);
+        let map = removal_map(&self.profile, used_size);
+        let out = engine::remove_at(&src.rgba, w, h, &map, ox, oy, color, strength);
         self.result = Some(RemovalResult {
             rgba: out,
             ox,
             oy,
-            size,
+            size: used_size,
         });
         self.det_info = match ncc {
             Some(n) => format!(
-                "Region {size}×{size} at {corner} ({ox},{oy}) · match {n:.2}{}",
-                if n < 0.12 { "  (low — adjust manually)" } else { "" }
+                "Region {used_size}×{used_size} at {corner} ({ox},{oy}) · match {n:.2}{}",
+                if n < 0.15 { "  (low — adjust manually)" } else { "" }
             ),
-            None => format!("Region {size}×{size} at {corner} ({ox},{oy}) · manual"),
+            None => format!("Region {used_size}×{used_size} at {corner} ({ox},{oy}) · manual"),
         };
         self.rebuild_result_preview();
     }

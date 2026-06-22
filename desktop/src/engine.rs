@@ -11,6 +11,8 @@
 
 use std::path::Path;
 
+use crate::catalog::WmConfig;
+
 #[inline]
 fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
     if v < lo {
@@ -203,6 +205,220 @@ pub fn detect(lum: &[f32], w: usize, h: usize, map: &AlphaMap) -> Option<Detecti
         }
     }
     Some(best)
+}
+
+/// Per-pixel grayscale in 0..=1 (Rec.709), matching the reference engine's
+/// `toGrayscale`. Used by the catalog detector's correlation scoring.
+pub fn gray01_of(rgba: &[u8], w: usize, h: usize) -> Vec<f32> {
+    let n = w * h;
+    let mut g = vec![0f32; n];
+    for p in 0..n {
+        let i = p * 4;
+        g[p] = (0.2126 * rgba[i] as f32 + 0.7152 * rgba[i + 1] as f32 + 0.0722 * rgba[i + 2] as f32)
+            / 255.0;
+    }
+    g
+}
+
+/// Sobel gradient magnitude of a `size×size` tile (borders left at 0), matching
+/// the reference engine's `sobelMagnitude` applied to an extracted region.
+fn sobel_tile(src: &[f32], size: usize) -> Vec<f32> {
+    let mut out = vec![0f32; size * size];
+    if size < 3 {
+        return out;
+    }
+    for y in 1..size - 1 {
+        for x in 1..size - 1 {
+            let i = y * size + x;
+            let gx = -src[i - size - 1] - 2.0 * src[i - 1] - src[i + size - 1]
+                + src[i - size + 1]
+                + 2.0 * src[i + 1]
+                + src[i + size + 1];
+            let gy = -src[i - size - 1] - 2.0 * src[i - size] - src[i - size + 1]
+                + src[i + size - 1]
+                + 2.0 * src[i + size]
+                + src[i + size + 1];
+            out[i] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    out
+}
+
+/// Bilinear resample of a square α-map to a new size (mirrors the reference
+/// engine's `interpolateAlphaMap`). Lets the single measured 96px profile seed
+/// templates at any catalog size.
+pub fn interpolate_alpha(src: &[f32], src_size: usize, target: usize) -> Vec<f32> {
+    if target == src_size {
+        return src.to_vec();
+    }
+    let mut out = vec![0f32; target * target];
+    let scale = (src_size as f32 - 1.0) / (target.max(2) as f32 - 1.0);
+    for y in 0..target {
+        let sy = y as f32 * scale;
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_size - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..target {
+            let sx = x as f32 * scale;
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_size - 1);
+            let fx = sx - x0 as f32;
+            let p00 = src[y0 * src_size + x0];
+            let p10 = src[y0 * src_size + x1];
+            let p01 = src[y1 * src_size + x0];
+            let p11 = src[y1 * src_size + x1];
+            let top = p00 + (p10 - p00) * fx;
+            let bot = p01 + (p11 - p01) * fx;
+            out[y * target + x] = top + (bot - top) * fy;
+        }
+    }
+    out
+}
+
+/// An α-map at an arbitrary tile size, interpolated from the 96px base when no
+/// exact map exists. Used so removal applies at the catalog-detected size.
+pub fn map_for_size(base96: &AlphaMap, size: usize) -> AlphaMap {
+    if size == base96.size {
+        return base96.clone();
+    }
+    AlphaMap::new(size, interpolate_alpha(&base96.a, base96.size, size))
+}
+
+/// Normalized cross-correlation of two equal-length signals (Pearson).
+fn ncc(a: &[f32], a_mean: f32, b: &[f32], b_mean: f32) -> f32 {
+    let mut num = 0f32;
+    let (mut da, mut db) = (0f32, 0f32);
+    for i in 0..a.len() {
+        let x = a[i] - a_mean;
+        let y = b[i] - b_mean;
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    let den = (da * db).sqrt();
+    if den > 1e-8 {
+        num / den
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn mean(v: &[f32]) -> f32 {
+    v.iter().copied().sum::<f32>() / v.len() as f32
+}
+
+/// A template (interpolated α-map + its Sobel magnitude) cached per tile size.
+struct Template {
+    alpha: Vec<f32>,
+    alpha_mean: f32,
+    grad: Vec<f32>,
+    grad_mean: f32,
+}
+
+/// Confidence that a watermark of `size` sits at `(ox, oy)`: a blend of raw-
+/// grayscale correlation (the dominant, flat-region-robust signal) and gradient
+/// correlation. Returns `None` if the tile is out of bounds.
+fn score_region(gray: &[f32], w: usize, h: usize, ox: i64, oy: i64, tpl: &Template, size: usize) -> Option<f32> {
+    if ox < 0 || oy < 0 || ox as usize + size > w || oy as usize + size > h {
+        return None;
+    }
+    let (ox, oy) = (ox as usize, oy as usize);
+    let mut reg = vec![0f32; size * size];
+    for y in 0..size {
+        let row = (oy + y) * w + ox;
+        let dst = y * size;
+        reg[dst..dst + size].copy_from_slice(&gray[row..row + size]);
+    }
+    let spatial = ncc(&reg, mean(&reg), &tpl.alpha, tpl.alpha_mean);
+    let rgrad = sobel_tile(&reg, size);
+    let gradient = ncc(&rgrad, mean(&rgrad), &tpl.grad, tpl.grad_mean);
+    Some(0.6 * spatial.max(0.0) + 0.4 * gradient.max(0.0))
+}
+
+/// Cube-root size penalty: NCC favours tiny templates, so down-weight small
+/// tiles to avoid a 48px window scoring high on part of a 96px mark
+/// (mirrors `computeSizeAdjustedConfidence`).
+#[inline]
+fn size_adjust(conf: f32, size: usize) -> f32 {
+    conf * (size as f32 / 96.0).cbrt().min(1.0)
+}
+
+/// Minimum size-adjusted confidence for a catalog anchor to count as a real
+/// watermark. Below this we remove *nothing* rather than risk burning a hole in
+/// clean pixels (the failure mode of an unconstrained corner search).
+pub const DETECT_THRESHOLD: f32 = 0.10;
+
+/// Locate the watermark by validating the **size catalog's** ordered anchors
+/// (see `catalog::search_configs`) and taking the first that clears
+/// `DETECT_THRESHOLD`, refined ±6px. This replaces the old free corner sweep,
+/// which could lock onto a coincidental correlation peak on a flat region.
+pub fn detect_catalog(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    base96: &AlphaMap,
+    configs: &[WmConfig],
+) -> Option<Detection> {
+    let gray = gray01_of(rgba, w, h);
+    let mut cache: Vec<(usize, Template)> = Vec::new();
+    let template = |cache: &mut Vec<(usize, Template)>, size: usize| -> usize {
+        if let Some(idx) = cache.iter().position(|(s, _)| *s == size) {
+            return idx;
+        }
+        let alpha = interpolate_alpha(&base96.a, base96.size, size);
+        let grad = sobel_tile(&alpha, size);
+        let (am, gm) = (mean(&alpha), mean(&grad));
+        cache.push((
+            size,
+            Template {
+                alpha,
+                alpha_mean: am,
+                grad,
+                grad_mean: gm,
+            },
+        ));
+        cache.len() - 1
+    };
+
+    const REFINE: i64 = 8;
+    // Evaluate every catalog anchor and keep the one with the highest
+    // size-adjusted confidence — rather than the first to clear the bar — so a
+    // weak-but-plausible smaller anchor can't pre-empt the true full-size mark.
+    let mut winner: Option<(f32, Detection)> = None; // (adjusted, detection)
+    for cfg in configs {
+        let Some((ox0, oy0)) = cfg.origin(w, h) else {
+            continue;
+        };
+        let size = cfg.size;
+        let ti = template(&mut cache, size);
+        let mut best: Option<(f32, i64, i64)> = None; // (conf, ox, oy)
+        for dy in -REFINE..=REFINE {
+            for dx in -REFINE..=REFINE {
+                if let Some(conf) = score_region(&gray, w, h, ox0 + dx, oy0 + dy, &cache[ti].1, size) {
+                    if best.map_or(true, |b| conf > b.0) {
+                        best = Some((conf, ox0 + dx, oy0 + dy));
+                    }
+                }
+            }
+        }
+        if let Some((conf, ox, oy)) = best {
+            let adjusted = size_adjust(conf, size);
+            if winner.as_ref().map_or(true, |(a, _)| adjusted > *a) {
+                winner = Some((
+                    adjusted,
+                    Detection {
+                        ncc: conf,
+                        ox,
+                        oy,
+                        corner: "br",
+                        size,
+                    },
+                ));
+            }
+        }
+    }
+    winner.filter(|(a, _)| *a >= DETECT_THRESHOLD).map(|(_, d)| d)
 }
 
 /// Reverse the α-composite over the tile at (ox, oy). `color` is the watermark
@@ -431,6 +647,50 @@ mod tests {
         assert_eq!(det.corner, "br");
         assert!((det.ox - ox).abs() <= 4, "detected ox {} vs {}", det.ox, ox);
         assert!((det.oy - oy).abs() <= 4, "detected oy {} vs {}", det.oy, oy);
+    }
+
+    /// Composite the real Gemini mark at the 96px/64px-margin anchor over a
+    /// textured background; the catalog detector must find it at the bottom-right
+    /// at size 96 — and must find *nothing* on the same image without a mark
+    /// (the regression guard against burning a hole in clean pixels).
+    #[test]
+    fn catalog_detector_finds_mark_and_rejects_clean() {
+        let map = default_map();
+        let (w, h) = (1200usize, 1000usize); // ≥1024 tier → 96px candidates
+        let mut clean = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                clean[i] = ((x * 31 + y * 17) % 200) as u8;
+                clean[i + 1] = ((x * 13 + y * 29) % 180 + 20) as u8;
+                clean[i + 2] = ((x * 7 + y * 11) % 160 + 40) as u8;
+                clean[i + 3] = 255;
+            }
+        }
+        let (t, m) = (96usize, 64i64);
+        let (ox, oy) = (w as i64 - t as i64 - m, h as i64 - t as i64 - m);
+        let mut obs = clean.clone();
+        for y in 0..t {
+            for x in 0..t {
+                let av = map.a[y * t + x];
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let configs = crate::catalog::search_configs(w, h);
+        let det = detect_catalog(&obs, w, h, &map, &configs).expect("should locate the mark");
+        assert_eq!(det.corner, "br");
+        assert_eq!(det.size, 96);
+        assert!((det.ox - ox).abs() <= 8 && (det.oy - oy).abs() <= 8, "at ({},{})", det.ox, det.oy);
+
+        // No watermark present → must not "detect" one (no false-positive removal).
+        assert!(
+            detect_catalog(&clean, w, h, &map, &configs).is_none(),
+            "detector fired on a clean image"
+        );
     }
 
     #[test]

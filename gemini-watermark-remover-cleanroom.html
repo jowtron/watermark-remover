@@ -265,6 +265,60 @@ wireDrop($('#drop'),$('#file'),async fs=>{ if(!fs[0])return; if(!Object.keys(MAP
 function boxBlur(L,W,H,r){const tmp=new Float32Array(W*H),out=new Float32Array(W*H),inv=1/(2*r+1);
   for(let y=0;y<H;y++){let acc=0;const o=y*W;for(let x=-r;x<=r;x++)acc+=L[o+clamp(x,0,W-1)];for(let x=0;x<W;x++){tmp[o+x]=acc*inv;acc+=L[o+clamp(x+r+1,0,W-1)]-L[o+clamp(x-r,0,W-1)];}}
   for(let x=0;x<W;x++){let acc=0;for(let y=-r;y<=r;y++)acc+=tmp[clamp(y,0,H-1)*W+x];for(let y=0;y<H;y++){out[y*W+x]=acc*inv;acc+=tmp[clamp(y+r+1,0,H-1)*W+x]-tmp[clamp(y-r,0,H-1)*W+x];}}return out;}
+/* ===== size catalog + catalog detector (mirrors desktop catalog.rs / engine.rs) =====
+   Gemini stamps the ✦ at a fixed {size,margin} per output size, so we validate a
+   short list of *known* anchors instead of free-scanning the corners (which can
+   lock onto a coincidental peak on a flat region and burn a hole there). */
+const CUR48={size:48,mr:32,mb:32}, LEG96={size:96,mr:64,mb:64}, NEW96={size:96,mr:192,mb:192}, LM48={size:48,mr:96,mb:96};
+const OFFICIAL=[ /* [w,h,family,tier]  family x=gemini-3.x f=gemini-2.5-flash */
+ [512,512,'x','05'],[256,1024,'x','05'],[192,1536,'x','05'],[424,632,'x','05'],[632,424,'x','05'],[448,600,'x','05'],[1024,256,'x','05'],[600,448,'x','05'],[464,576,'x','05'],[576,464,'x','05'],[1536,192,'x','05'],[384,688,'x','05'],[688,384,'x','05'],[792,168,'x','05'],
+ [1024,1024,'x','1'],[512,2048,'x','1'],[384,3072,'x','1'],[848,1264,'x','1'],[1264,848,'x','1'],[896,1200,'x','1'],[2048,512,'x','1'],[1200,896,'x','1'],[928,1152,'x','1'],[1152,928,'x','1'],[3072,384,'x','1'],[768,1376,'x','1'],[1376,768,'x','1'],[1408,768,'x','1'],[1584,672,'x','1'],
+ [2048,2048,'x','2'],[1024,4096,'x','2'],[768,6144,'x','2'],[1696,2528,'x','2'],[2528,1696,'x','2'],[1792,2400,'x','2'],[4096,1024,'x','2'],[2400,1792,'x','2'],[1856,2304,'x','2'],[2304,1856,'x','2'],[6144,768,'x','2'],[1536,2752,'x','2'],[2752,1536,'x','2'],[3168,1344,'x','2'],
+ [2816,1536,'x','2n'],
+ [4096,4096,'x','4'],[2048,8192,'x','4'],[1536,12288,'x','4'],[3392,5056,'x','4'],[5056,3392,'x','4'],[3584,4800,'x','4'],[8192,2048,'x','4'],[4800,3584,'x','4'],[3712,4608,'x','4'],[4608,3712,'x','4'],[12288,1536,'x','4'],[3072,5504,'x','4'],[5504,3072,'x','4'],[6336,2688,'x','4'],
+ [1024,1024,'f','1'],[832,1248,'f','1'],[1248,832,'f','1'],[864,1184,'f','1'],[1184,864,'f','1'],[896,1152,'f','1'],[1152,896,'f','1'],[768,1344,'f','1'],[1344,768,'f','1'],[1536,672,'f','1']];
+function entryConfigs(e){ const fam=e[2],t=e[3];
+  if(t==='05')return[CUR48]; if(t==='1')return fam==='x'?[CUR48,LEG96,LM48]:[LEG96];
+  if(t==='2n')return[NEW96]; return[LEG96]; }
+function cfgFits(c,W,H){return W-c.mr-c.size>=0 && H-c.mb-c.size>=0;}
+function projectCfg(b,sx,sy){const sc=(sx+sy)/2;return{size:clamp(Math.round(b.size*sc),24,192),mr:Math.max(8,Math.round(b.mr*sx)),mb:Math.max(8,Math.round(b.mb*sy))};}
+function searchConfigs(W,H){ const out=[],seen=new Set();
+  const push=c=>{ if(cfgFits(c,W,H)){const k=c.size+':'+c.mr+':'+c.mb; if(!seen.has(k)){seen.add(k);out.push(c);}} };
+  const large=Math.min(W,H)>=1024, ex=OFFICIAL.find(e=>e[0]===W&&e[1]===H);
+  if(ex){ entryConfigs(ex).forEach(push); }
+  else{ push(large?LEG96:CUR48); const tar=W/H,proj=[];
+    for(const e of OFFICIAL){ const ew=e[0],eh=e[1],sx=W/ew,sy=H/eh,ad=Math.abs(tar-ew/eh)/(ew/eh),sm=Math.abs(sx-sy)/Math.max(sx,sy);
+      if(ad>0.02||sm>0.12)continue; proj.push([ad*100+sm*20,projectCfg(entryConfigs(e)[0],sx,sy)]); }
+    proj.sort((a,b)=>a[0]-b[0]); proj.slice(0,3).forEach(p=>push(p[1])); }
+  if(large){ push(LEG96); push(NEW96); } else { push(CUR48); push(LM48); push(LEG96); }
+  return out; }
+function gray01(id){const d=id.data,n=id.width*id.height,g=new Float32Array(n);for(let i=0,p=0;p<n;i+=4,p++)g[p]=(0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2])/255;return g;}
+function sobelTile(s,S){const o=new Float32Array(S*S);if(S<3)return o;
+  for(let y=1;y<S-1;y++)for(let x=1;x<S-1;x++){const i=y*S+x;
+    const gx=-s[i-S-1]-2*s[i-1]-s[i+S-1]+s[i-S+1]+2*s[i+1]+s[i+S+1],gy=-s[i-S-1]-2*s[i-S]-s[i-S+1]+s[i+S-1]+2*s[i+S]+s[i+S+1];
+    o[i]=Math.hypot(gx,gy);}return o;}
+function interpAlpha(a,ss,ts){ if(ts===ss)return a.slice(); const o=new Float32Array(ts*ts),sc=(ss-1)/Math.max(2,ts-1);
+  for(let y=0;y<ts;y++){const sy=y*sc,y0=Math.floor(sy),y1=Math.min(ss-1,y0+1),fy=sy-y0;
+    for(let x=0;x<ts;x++){const sx=x*sc,x0=Math.floor(sx),x1=Math.min(ss-1,x0+1),fx=sx-x0;
+      const p00=a[y0*ss+x0],p10=a[y0*ss+x1],p01=a[y1*ss+x0],p11=a[y1*ss+x1],t=p00+(p10-p00)*fx,b=p01+(p11-p01)*fx;o[y*ts+x]=t+(b-t)*fy;}}return o;}
+function meanArr(v){let s=0;for(let i=0;i<v.length;i++)s+=v[i];return s/v.length;}
+function nccArr(a,am,b,bm){let num=0,da=0,db=0;for(let i=0;i<a.length;i++){const x=a[i]-am,y=b[i]-bm;num+=x*y;da+=x*x;db+=y*y;}const den=Math.sqrt(da*db);return den>1e-8?num/den:0;}
+function mapForSize(size){ if(MAPS[size])return{size,a:MAPS[size].a}; const ks=Object.keys(MAPS).map(Number).filter(Number.isFinite); const base=MAPS[96]||MAPS[ks[0]]; return{size,a:interpAlpha(base.a,base.size,size)}; }
+const DETECT_THRESHOLD=0.10;
+/* Validate every catalog anchor (raw-grayscale + gradient NCC) and keep the
+   highest size-adjusted confidence; remove nothing if none clears the bar. */
+function detectCatalog(){ const base=MAPS[96]; if(!base)return null; const {width:W,height:H}=SRC;
+  const gray=gray01(SRC.data), configs=searchConfigs(W,H), tcache={};
+  const tpl=S=>{ if(tcache[S])return tcache[S]; const a=interpAlpha(base.a,96,S),g=sobelTile(a,S); return tcache[S]={a,am:meanArr(a),g,gm:meanArr(g)}; };
+  let winner=null;
+  for(const c of configs){ const ox0=W-c.mr-c.size,oy0=H-c.mb-c.size; if(ox0<0||oy0<0)continue;
+    const S=c.size,t=tpl(S); let best=null;
+    for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){ const ox=ox0+dx,oy=oy0+dy; if(ox<0||oy<0||ox+S>W||oy+S>H)continue;
+      const reg=new Float32Array(S*S); for(let y=0;y<S;y++){const row=(oy+y)*W+ox,d=y*S;for(let x=0;x<S;x++)reg[d+x]=gray[row+x];}
+      const sp=Math.max(0,nccArr(reg,meanArr(reg),t.a,t.am)),rg=sobelTile(reg,S),gr=Math.max(0,nccArr(rg,meanArr(rg),t.g,t.gm)),conf=0.6*sp+0.4*gr;
+      if(!best||conf>best.conf)best={conf,ox,oy}; }
+    if(best){ const adj=best.conf*Math.min(1,Math.cbrt(S/96)); if(!winner||adj>winner.adj)winner={adj,ncc:best.conf,ox:best.ox,oy:best.oy,size:S,corner:'br'}; } }
+  return winner&&winner.adj>=DETECT_THRESHOLD?winner:null; }
 function detect(size){ const {width:W,height:H}=SRC,m=MAPS[size],T=size,A=m.a;
   const L=lumOf(SRC.data),B=boxBlur(L,W,H,Math.round(T*0.75)),Hp=new Float32Array(W*H);
   for(let i=0;i<Hp.length;i++)Hp[i]=L[i]-B[i];
@@ -276,20 +330,22 @@ function detect(size){ const {width:W,height:H}=SRC,m=MAPS[size],T=size,A=m.a;
   if(best.ncc<=-2)return null;
   for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){const ox=best.ox+dx,oy=best.oy+dy,ncc=score(ox,oy);if(ncc>best.ncc)best={...best,ncc,ox,oy};}
   best.size=size;return best; }
-function removeAt(size,ox,oy,W255,strength){ const {width:W,height:H}=SRC,T=size,A=MAPS[size].a;
+function removeAt(map,ox,oy,W255,strength){ const {width:W,height:H}=SRC,T=map.size,A=map.a;
   const out=new ImageData(new Uint8ClampedArray(SRC.data.data),W,H),d=out.data,s=SRC.data.data;
   for(let y=0;y<T;y++){const gy=oy+y;if(gy<0||gy>=H)continue;for(let x=0;x<T;x++){const gx=ox+x;if(gx<0||gx>=W)continue;
     let a=A[y*T+x]*strength;if(a<=0.002)continue;if(a>0.98)a=0.98;const inv=1-a,i=(gy*W+gx)*4;
     d[i]=clamp((s[i]-W255[0]*a)/inv,0,255);d[i+1]=clamp((s[i+1]-W255[1]*a)/inv,0,255);d[i+2]=clamp((s[i+2]-W255[2]*a)/inv,0,255);}}
   return out; }
 function run(){ if(!SRC)return; const size=pickSize(); if(size==null)return;
-  const sel=$('#corner').value; let ox,oy,corner,ncc=null;
-  if(sel==='auto'){ const det=detect(size); if(!det){$('#detinfo').textContent='Could not locate the watermark.';return;} ({ox,oy,corner,ncc}=det); }
+  const sel=$('#corner').value; let ox,oy,corner,ncc=null,used=size;
+  if(sel==='auto'){ const det = MAPS[96] ? detectCatalog() : detect(size);
+    if(!det){$('#detinfo').textContent='Could not locate the watermark.';return;}
+    ({ox,oy,corner}=det); ncc=det.ncc; used=det.size; }
   else { const T=size,W=SRC.width,H=SRC.height,m=(W>=1024&&H>=1024)?64:32; const map={br:[W-T-m,H-T-m],bl:[m,H-T-m],tr:[W-T-m,m],tl:[m,m]};[ox,oy]=map[sel];corner=sel; }
   ox+=+$('#nudgeX').value||0; oy+=+$('#nudgeY').value||0;
   const c=$('#wcolor').value,W255=[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
-  const out=removeAt(size,ox,oy,W255,(+$('#strength').value)/100); LAST={out,ox,oy,size};
-  $('#detinfo').innerHTML=`Region <span class="badge ok">${size}×${size}</span> at <b>${corner}</b> (${ox},${oy})`+(ncc!=null?` · match <b>${ncc.toFixed(2)}</b>${ncc<0.12?' <span class="badge bad">low — adjust manually</span>':''}`:' · manual');
+  const out=removeAt(mapForSize(used),ox,oy,W255,(+$('#strength').value)/100); LAST={out,ox,oy,size:used};
+  $('#detinfo').innerHTML=`Region <span class="badge ok">${used}×${used}</span> at <b>${corner}</b> (${ox},${oy})`+(ncc!=null?` · match <b>${ncc.toFixed(2)}</b>${ncc<0.15?' <span class="badge bad">low — adjust manually</span>':''}`:' · manual');
   render(); }
 function render(){ if(!LAST)return; const img=$('#before').checked?SRC.data:LAST.out,cv=$('#cv'),T=LAST.size;
   if($('#zoom').checked){ const pad=Math.round(T*0.6); let x0=clamp(LAST.ox-pad,0,SRC.width),y0=clamp(LAST.oy-pad,0,SRC.height),x1=clamp(LAST.ox+T+pad,0,SRC.width),y1=clamp(LAST.oy+T+pad,0,SRC.height);
