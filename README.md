@@ -1,5 +1,7 @@
 # Watermark Remover
 
+**Live: https://watermarkremover.jderrick.app**
+
 A single-file, in-browser tool that removes a fixed semi-transparent watermark (e.g. the Gemini ✦ star) by reversing its alpha composite. No uploads, no server — all processing runs locally in the browser tab.
 
 ## How it works
