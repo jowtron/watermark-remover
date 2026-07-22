@@ -10,8 +10,8 @@ mod profile;
 
 use iced::widget::image::{FilterMethod, Handle};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
-    Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, text,
+    text_input, Space,
 };
 use iced::{Alignment, Border, Color, Element, Length, Size, Subscription, Task, Theme};
 
@@ -277,6 +277,8 @@ enum Message {
     ToggleOutline(bool),
     ToggleBefore(bool),
     ToggleZoom(bool),
+    PreviewCursor(iced::Point),
+    PreviewClicked,
     Save,
     AddLearnImages,
     LearnCorner(CornerSel),
@@ -300,6 +302,10 @@ struct App {
     result: Option<RemovalResult>,
     result_handle: Option<Handle>,
     result_disp: (f32, f32),
+    // maps a click on the preview back to image pixels: image = origin + point·scale
+    preview_origin: (i64, i64),
+    preview_scale: f32,
+    preview_cursor: Option<iced::Point>,
     corner_sel: CornerSel,
     nudge_x: String,
     nudge_y: String,
@@ -350,6 +356,9 @@ impl App {
             result: None,
             result_handle: None,
             result_disp: (0.0, 0.0),
+            preview_origin: (0, 0),
+            preview_scale: 1.0,
+            preview_cursor: None,
             corner_sel: CornerSel::Auto,
             nudge_x: "0".into(),
             nudge_y: "0".into(),
@@ -453,6 +462,8 @@ impl App {
                 self.show_zoom = b;
                 self.rebuild_result_preview();
             }
+            Message::PreviewCursor(p) => self.preview_cursor = Some(p),
+            Message::PreviewClicked => self.place_at_cursor(),
             Message::Save => self.save_result(),
             Message::AddLearnImages => {
                 if let Some(paths) = rfd::FileDialog::new()
@@ -693,6 +704,26 @@ impl App {
         self.rebuild_result_preview();
     }
 
+    /// Click-to-place: centre the tile on the clicked preview spot, expressed
+    /// as corner=br + nudge so the nudge steppers keep working for fine
+    /// adjustment. Rescues marks auto-detect misses (e.g. occluded by art).
+    fn place_at_cursor(&mut self) {
+        let Some(src) = &self.src else { return };
+        let Some(p) = self.preview_cursor else { return };
+        let Some(t) = self.profile.pick_size(src.w, src.h) else {
+            return;
+        };
+        let t = t as i64;
+        let (w, h) = (src.w as i64, src.h as i64);
+        let ix = (self.preview_origin.0 as f32 + p.x * self.preview_scale).round() as i64 - t / 2;
+        let iy = (self.preview_origin.1 as f32 + p.y * self.preview_scale).round() as i64 - t / 2;
+        let m = if src.w >= 1024 && src.h >= 1024 { 64i64 } else { 32 };
+        self.corner_sel = CornerSel::Br;
+        self.nudge_x = (ix - (w - t - m)).to_string();
+        self.nudge_y = (iy - (h - t - m)).to_string();
+        self.run_removal();
+    }
+
     fn rebuild_result_preview(&mut self) {
         let Some(src) = &self.src else { return };
         let Some(res) = &self.result else { return };
@@ -727,6 +758,8 @@ impl App {
                 );
             }
             self.result_disp = display_size(cw, ch, 760.0);
+            self.preview_origin = (x0, y0);
+            self.preview_scale = cw as f32 / self.result_disp.0;
             self.result_handle = Some(Handle::from_rgba(cw as u32, ch as u32, crop));
         } else {
             let (pw, ph, mut px) = fit_rgba(base, w, h, 1000);
@@ -745,6 +778,8 @@ impl App {
                 let _ = sy;
             }
             self.result_disp = (pw as f32, ph as f32);
+            self.preview_origin = (0, 0);
+            self.preview_scale = w as f32 / pw as f32;
             self.result_handle = Some(Handle::from_rgba(pw as u32, ph as u32, px));
         }
     }
@@ -1011,12 +1046,21 @@ impl App {
             if let Some(h) = &self.result_handle {
                 result_col = result_col.push(
                     container(
-                        iced::widget::image(h.clone())
-                            .width(Length::Fixed(self.result_disp.0))
-                            .height(Length::Fixed(self.result_disp.1)),
+                        mouse_area(
+                            iced::widget::image(h.clone())
+                                .width(Length::Fixed(self.result_disp.0))
+                                .height(Length::Fixed(self.result_disp.1)),
+                        )
+                        .on_move(Message::PreviewCursor)
+                        .on_press(Message::PreviewClicked)
+                        .interaction(iced::mouse::Interaction::Crosshair),
                     )
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
+                );
+                result_col = result_col.push(
+                    text("Tip: click the image to place the mark by hand — useful when it sits on busy art and auto-detect misses it.")
+                        .size(12),
                 );
             }
             col = col.push(panel(result_col));

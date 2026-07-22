@@ -234,7 +234,8 @@
       <label style="margin:0"><input type="checkbox" id="zoom"> zoom</label>
       <div style="flex:1"></div><button class="primary" id="dl">Download PNG</button>
     </div>
-    <div style="margin-top:12px"><canvas id="cv"></canvas></div>
+    <div style="margin-top:12px"><canvas id="cv" style="cursor:crosshair"></canvas>
+      <div class="hint" style="margin-top:4px">Tip: click the preview to place the mark by hand — useful when it sits on busy art and auto-detect misses it.</div></div>
   </div>
 </section>
 
@@ -516,11 +517,35 @@ function meanArr(v){let s=0;for(let i=0;i<v.length;i++)s+=v[i];return s/v.length
 function nccArr(a,am,b,bm){let num=0,da=0,db=0;for(let i=0;i<a.length;i++){const x=a[i]-am,y=b[i]-bm;num+=x*y;da+=x*x;db+=y*y;}const den=Math.sqrt(da*db);return den>1e-8?num/den:0;}
 function mapForSize(size){ if(MAPS[size])return{size,a:MAPS[size].a}; const ks=Object.keys(MAPS).map(Number).filter(Number.isFinite); const base=MAPS[96]||MAPS[ks[0]]; return{size,a:interpAlpha(base.a,base.size,size)}; }
 const DETECT_THRESHOLD=0.10;
+/* Occlusion-robust "removal improves smoothness" score: un-blending at the
+   right spot dissolves the α-edge structure into the background (art edges
+   crossing the tile contribute the same total variation before and after),
+   while un-blending a clean or wrong tile *introduces* a star artifact.
+   Returns the relative TV drop over the α-edge band, maximized over a strength
+   grid; > 0 only where a mark plausibly sits. Each gradient is weighted by
+   (1-α·s) to cancel the 1/(1-α·s) noise amplification of the un-blend, which
+   otherwise biases the score toward low strengths. Sharply alignment-sensitive,
+   so callers refine position with it. */
+function dtvScore(gray,W,H,ox,oy,t,S){ if(ox<0||oy<0||ox+S>W||oy+S>H)return null;
+  const reg=new Float32Array(S*S); for(let y=0;y<S;y++){const row=(oy+y)*W+ox,d=y*S;for(let x=0;x<S;x++)reg[d+x]=gray[row+x];}
+  const bandGrad=tile=>{ const out=new Float32Array(t.band.length);
+    for(let k=0;k<t.band.length;k++){ const i=t.band[k],y=(i/S)|0,x=i%S,xm=x>0?x-1:x,xp=x+1<S?x+1:x,ym=y>0?y-1:y,yp=y+1<S?y+1:y;
+      const gx=tile[y*S+xp]-tile[y*S+xm],gy=tile[yp*S+x]-tile[ym*S+x]; out[k]=Math.hypot(gx,gy); } return out; };
+  let tvO=0; { const g=bandGrad(reg); for(let k=0;k<g.length;k++)tvO+=g[k]; }
+  let tvMin=Infinity; const cor=new Float32Array(S*S);
+  for(let s=0.30;s<=1.20+1e-4;s+=0.10){
+    for(let i=0;i<S*S;i++){const av=Math.min(0.98,t.a[i]*s);cor[i]=(reg[i]-av)/(1-av);}
+    const g=bandGrad(cor); let tv=0; for(let k=0;k<g.length;k++)tv+=g[k]*(1-Math.min(0.98,t.a[t.band[k]]*s));
+    if(tv<tvMin)tvMin=tv; }
+  return (tvO-tvMin)/Math.max(tvO,1e-6); }
 /* Validate every catalog anchor (raw-grayscale + gradient NCC) and keep the
    highest size-adjusted confidence; remove nothing if none clears the bar. */
 function detectCatalog(){ const base=MAPS[96]; if(!base)return null; const {width:W,height:H}=SRC;
   const gray=gray01(SRC.data), configs=searchConfigs(W,H), tcache={};
-  const tpl=S=>{ if(tcache[S])return tcache[S]; const a=interpAlpha(base.a,96,S),g=sobelTile(a,S); return tcache[S]={a,am:meanArr(a),g,gm:meanArr(g)}; };
+  const tpl=S=>{ if(tcache[S])return tcache[S]; const a=interpAlpha(base.a,96,S),g=sobelTile(a,S);
+    const band=[]; for(let y=0;y<S;y++)for(let x=0;x<S;x++){ const xm=x>0?x-1:x,xp=x+1<S?x+1:x,ym=y>0?y-1:y,yp=y+1<S?y+1:y;
+      const gx=a[y*S+xp]-a[y*S+xm],gy=a[yp*S+x]-a[ym*S+x]; if(Math.hypot(gx,gy)>0.02)band.push(y*S+x); }
+    return tcache[S]={a,am:meanArr(a),g,gm:meanArr(g),band}; };
   let winner=null;
   for(const c of configs){ const ox0=W-c.mr-c.size,oy0=H-c.mb-c.size; if(ox0<0||oy0<0)continue;
     const S=c.size,t=tpl(S); let best=null;
@@ -529,6 +554,17 @@ function detectCatalog(){ const base=MAPS[96]; if(!base)return null; const {widt
       const sp=Math.max(0,nccArr(reg,meanArr(reg),t.a,t.am)),rg=sobelTile(reg,S),gr=Math.max(0,nccArr(rg,meanArr(rg),t.g,t.gm)),conf=0.6*sp+0.4*gr;
       if(!best||conf>best.conf)best={conf,ox,oy}; }
     if(best){ const adj=best.conf*Math.min(1,Math.cbrt(S/96)); if(!winner||adj>winner.adj)winner={adj,ncc:best.conf,ox:best.ox,oy:best.oy,size:S,corner:'br'}; } }
+  /* Occlusion fallback: when no anchor validates convincingly by correlation
+     (art crossing the tile wrecks full-tile NCC, and the mark is invisible
+     where background ≈ mark colour), re-rank the anchors by the TV-drop score,
+     which only looks at the α-edge band and is indifferent to background
+     structure. It does its own ±8 position search from each raw anchor. */
+  if(!winner||winner.adj<0.35){ let bt=null;
+    for(const c of configs){ const ox0=W-c.mr-c.size,oy0=H-c.mb-c.size; if(ox0<0||oy0<0)continue;
+      const S=c.size,t=tpl(S);
+      for(let dy=-8;dy<=8;dy++)for(let dx=-8;dx<=8;dx++){ const d=dtvScore(gray,W,H,ox0+dx,oy0+dy,t,S);
+        if(d!==null&&(!bt||d>bt.d))bt={d,ox:ox0+dx,oy:oy0+dy,size:S}; } }
+    if(bt&&bt.d>=0.07)return{adj:bt.d,ncc:bt.d,ox:bt.ox,oy:bt.oy,size:bt.size,corner:'br'}; }
   return winner&&winner.adj>=DETECT_THRESHOLD?winner:null; }
 function detect(size){ const {width:W,height:H}=SRC,m=MAPS[size],T=size,A=m.a;
   const L=lumOf(SRC.data),B=boxBlur(L,W,H,Math.round(T*0.75)),Hp=new Float32Array(W*H);
@@ -547,11 +583,32 @@ function removeAt(map,ox,oy,W255,strength){ const {width:W,height:H}=SRC,T=map.s
     let a=A[y*T+x]*strength;if(a<=0.002)continue;if(a>0.98)a=0.98;const inv=1-a,i=(gy*W+gx)*4;
     d[i]=clamp((s[i]-W255[0]*a)/inv,0,255);d[i+1]=clamp((s[i+1]-W255[1]*a)/inv,0,255);d[i+2]=clamp((s[i+2]-W255[2]*a)/inv,0,255);}}
   return out; }
-/* Auto-estimate the opacity scale: the strength at which the un-blended tile
-   stops correlating with the watermark shape. Fixes the dark/over-saturated
-   patch when the profile is more opaque than the mark is in this image.
-   Residual↔shape correlation is monotone in s, so scan and interpolate zero. */
+/* Auto-estimate the opacity scale by paired-pixel regression: each strong-α
+   pixel is paired with the nearest un-marked pixel along 8 directions as its
+   local background estimate b, giving a direct per-pixel solve
+   s = (o-b)/(α(c-b)) from the blend model o = b(1-αs)+c·αs; the median over
+   all pairs is the answer. Pairs whose background is too close to the mark
+   colour are skipped — there the blend is insensitive to s (white mark on
+   white background), which is also what makes this robust to hard art edges
+   crossing the tile (the failure mode of the residual-correlation method
+   below, kept as fallback for tiles with too few usable pairs). */
 function calibrateStrength(map,ox,oy,W255){ const {width:W,height:H}=SRC,s=SRC.data.data,T=map.size,A=map.a;
+  const lumW=0.299*W255[0]+0.587*W255[1]+0.114*W255[2], cl=(v,hi)=>v<0?0:(v>=hi?hi-1:v);
+  const O=new Float32Array(T*T);
+  for(let y=0;y<T;y++){const gy=cl(oy+y,H);for(let x=0;x<T;x++){const gx=cl(ox+x,W),i=(gy*W+gx)*4;O[y*T+x]=0.299*s[i]+0.587*s[i+1]+0.114*s[i+2];}}
+  const DIRS=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]],samples=[];
+  for(let y=0;y<T;y++)for(let x=0;x<T;x++){ const av=A[y*T+x]; if(av<0.30)continue;
+    for(const [dx,dy] of DIRS){ let cx=x,cy=y;
+      for(let st=0;st<40;st++){ cx+=dx;cy+=dy; if(cx<0||cy<0||cx>=T||cy>=T)break;
+        if(A[cy*T+cx]<0.02){ const b=O[cy*T+cx]; if(Math.abs(lumW-b)>=40)samples.push((O[y*T+x]-b)/(av*(lumW-b))); break; } } } }
+  if(samples.length>=20){ samples.sort((p,q)=>p-q); const n=samples.length,med=n%2?samples[(n-1)/2]:(samples[n/2-1]+samples[n/2])/2;
+    return Math.min(1.20,Math.max(0.30,med)); }
+  return calibrateStrengthResidual(map,ox,oy,W255); }
+/* The pre-2026-07-22 auto-opacity: the strength at which the un-blended tile
+   stops correlating with the watermark shape. Accurate on unoccluded marks but
+   misled by hard high-contrast edges inside the tile; kept as fallback.
+   Residual↔shape correlation is monotone in s, so scan and interpolate zero. */
+function calibrateStrengthResidual(map,ox,oy,W255){ const {width:W,height:H}=SRC,s=SRC.data.data,T=map.size,A=map.a;
   let aMean=0; for(let i=0;i<A.length;i++)aMean+=A[i]; aMean/=A.length;
   const lumW=0.299*W255[0]+0.587*W255[1]+0.114*W255[2];
   const cl=(v,hi)=>v<0?0:(v>=hi?hi-1:v);
@@ -642,8 +699,20 @@ function render(){ if(!LAST)return; const img=$('#before').checked?SRC.data:LAST
     const w=x1-x0,h=y1-y0,tmp=document.createElement('canvas');tmp.width=SRC.width;tmp.height=SRC.height;tmp.getContext('2d').putImageData(img,0,0);
     cv.width=w;cv.height=h;const x=cv.getContext('2d');x.imageSmoothingEnabled=false;x.drawImage(tmp,x0,y0,w,h,0,0,w,h);
     if($('#outline').checked){x.strokeStyle='#3b82f6';x.lineWidth=2;x.strokeRect(LAST.ox-x0,LAST.oy-y0,T,T);}
+    LAST.viewX0=x0;LAST.viewY0=y0;
   } else { cv.width=img.width;cv.height=img.height;const x=cv.getContext('2d');x.putImageData(img,0,0);
-    if($('#outline').checked){x.strokeStyle='#3b82f6';x.lineWidth=Math.max(1,cv.width/400);x.strokeRect(LAST.ox,LAST.oy,T,T);} } }
+    if($('#outline').checked){x.strokeStyle='#3b82f6';x.lineWidth=Math.max(1,cv.width/400);x.strokeRect(LAST.ox,LAST.oy,T,T);}
+    LAST.viewX0=0;LAST.viewY0=0; } }
+/* Click the preview to place the mark by hand (occluded/undetectable marks):
+   centres the tile on the clicked spot via corner=br + nudge, so the existing
+   nudge steppers keep working for fine adjustment. */
+$('#cv').addEventListener('click',e=>{ if(!SRC||!LAST)return;
+  const cv=$('#cv'),r=cv.getBoundingClientRect(); if(!r.width||!r.height)return;
+  const px=(e.clientX-r.left)*cv.width/r.width, py=(e.clientY-r.top)*cv.height/r.height;
+  const T=pickSize(); if(T==null)return;
+  const ix=Math.round(px+(LAST.viewX0||0)-T/2), iy=Math.round(py+(LAST.viewY0||0)-T/2);
+  const W=SRC.width,H=SRC.height,m=(W>=1024&&H>=1024)?64:32;
+  $('#corner').value='br'; $('#nudgeX').value=ix-(W-T-m); $('#nudgeY').value=iy-(H-T-m); run(); });
 $('#run').onclick=run;
 ['corner','nudgeX','nudgeY','wcolor','strength'].forEach(id=>$('#'+id).addEventListener('input',()=>{if(id==='strength'){$('#autoOpac').checked=false;$('#sv').textContent=$('#strength').value+'%';try{localStorage.setItem('wmStrength',$('#strength').value);}catch(e){}}run();}));
 ['autoOpac','feather','reconstruct'].forEach(id=>$('#'+id).addEventListener('change',run));

@@ -244,6 +244,26 @@ fn sobel_tile(src: &[f32], size: usize) -> Vec<f32> {
     out
 }
 
+/// Central-difference gradient magnitude at every pixel of a size×size tile
+/// (edge-clamped). A cheaper, more localized operator than the 3×3 Sobel used
+/// for template matching; used by the occlusion-robust TV scoring.
+fn grad_tile(src: &[f32], size: usize) -> Vec<f32> {
+    let mut out = vec![0f32; size * size];
+    for y in 0..size {
+        let ym = y.saturating_sub(1) * size;
+        let yp = (y + 1).min(size - 1) * size;
+        let yc = y * size;
+        for x in 0..size {
+            let xm = x.saturating_sub(1);
+            let xp = (x + 1).min(size - 1);
+            let gx = src[yc + xp] - src[yc + xm];
+            let gy = src[yp + x] - src[ym + x];
+            out[yc + x] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    out
+}
+
 /// Bilinear resample of a square α-map to a new size (mirrors the reference
 /// engine's `interpolateAlphaMap`). Lets the single measured 96px profile seed
 /// templates at any catalog size.
@@ -314,6 +334,9 @@ struct Template {
     alpha_mean: f32,
     grad: Vec<f32>,
     grad_mean: f32,
+    /// Indices of the α-edge band (|∇α| > 0.02) — where un-blending visibly
+    /// changes local structure. The TV fallback score is confined to it.
+    edge_band: Vec<usize>,
 }
 
 /// Confidence that a watermark of `size` sits at `(ox, oy)`: a blend of raw-
@@ -334,6 +357,62 @@ fn score_region(gray: &[f32], w: usize, h: usize, ox: i64, oy: i64, tpl: &Templa
     let rgrad = sobel_tile(&reg, size);
     let gradient = ncc(&rgrad, mean(&rgrad), &tpl.grad, tpl.grad_mean);
     Some(0.6 * spatial.max(0.0) + 0.4 * gradient.max(0.0))
+}
+
+/// Occlusion-robust "removal improves smoothness" score. Un-blending at the
+/// right spot dissolves the α-edge structure into the background (art edges
+/// crossing the tile contribute the same total variation before and after),
+/// while un-blending a clean or wrong tile *introduces* a star-shaped artifact.
+/// Returns the relative TV drop over the α-edge band, maximized over a strength
+/// grid; > 0 only where a mark plausibly sits. Each gradient is weighted by
+/// (1−α·s) to cancel the 1/(1−α·s) noise amplification of the un-blend, which
+/// otherwise biases the score toward low strengths.
+fn dtv_score(gray: &[f32], w: usize, h: usize, ox: i64, oy: i64, tpl: &Template, size: usize) -> Option<f32> {
+    if ox < 0 || oy < 0 || ox as usize + size > w || oy as usize + size > h {
+        return None;
+    }
+    let (ox, oy) = (ox as usize, oy as usize);
+    let mut reg = vec![0f32; size * size];
+    for y in 0..size {
+        let row = (oy + y) * w + ox;
+        let dst = y * size;
+        reg[dst..dst + size].copy_from_slice(&gray[row..row + size]);
+    }
+    let band_grad = |tile: &[f32]| -> Vec<f32> {
+        tpl.edge_band
+            .iter()
+            .map(|&i| {
+                let (y, x) = (i / size, i % size);
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(size - 1);
+                let ym = y.saturating_sub(1);
+                let yp = (y + 1).min(size - 1);
+                let gx = tile[y * size + xp] - tile[y * size + xm];
+                let gy = tile[yp * size + x] - tile[ym * size + x];
+                (gx * gx + gy * gy).sqrt()
+            })
+            .collect()
+    };
+    let tv_o: f32 = band_grad(&reg).iter().sum();
+    let mut tv_min = f32::INFINITY;
+    let mut cor = vec![0f32; size * size];
+    let mut s = 0.30f32;
+    while s <= 1.20 + 1e-4 {
+        for i in 0..size * size {
+            let av = (tpl.alpha[i] * s).min(0.98);
+            cor[i] = (reg[i] - av) / (1.0 - av);
+        }
+        let g = band_grad(&cor);
+        let tv: f32 = tpl
+            .edge_band
+            .iter()
+            .zip(g.iter())
+            .map(|(&i, gv)| gv * (1.0 - (tpl.alpha[i] * s).min(0.98)))
+            .sum();
+        tv_min = tv_min.min(tv);
+        s += 0.10;
+    }
+    Some((tv_o - tv_min) / tv_o.max(1e-6))
 }
 
 /// Cube-root size penalty: NCC favours tiny templates, so down-weight small
@@ -369,6 +448,8 @@ pub fn detect_catalog(
         let alpha = interpolate_alpha(&base96.a, base96.size, size);
         let grad = sobel_tile(&alpha, size);
         let (am, gm) = (mean(&alpha), mean(&grad));
+        let cd = grad_tile(&alpha, size);
+        let edge_band = (0..size * size).filter(|&i| cd[i] > 0.02).collect();
         cache.push((
             size,
             Template {
@@ -376,6 +457,7 @@ pub fn detect_catalog(
                 alpha_mean: am,
                 grad,
                 grad_mean: gm,
+                edge_band,
             },
         ));
         cache.len() - 1
@@ -418,6 +500,48 @@ pub fn detect_catalog(
             }
         }
     }
+    // Occlusion fallback: when no anchor validates convincingly by correlation
+    // (art crossing the tile wrecks full-tile NCC, and the mark is invisible
+    // where background ≈ mark colour), re-rank the anchors by the TV-drop
+    // score, which only looks at the α-edge band and is indifferent to
+    // background structure. The score is sharply alignment-sensitive, so it
+    // does its own ±REFINE position search from the raw catalog origin.
+    const STRONG: f32 = 0.35;
+    const DTV_ACCEPT: f32 = 0.07;
+    if winner.as_ref().map_or(true, |(a, _)| *a < STRONG) {
+        let mut best_tv: Option<(f32, Detection)> = None;
+        for cfg in configs {
+            let Some((ox0, oy0)) = cfg.origin(w, h) else {
+                continue;
+            };
+            let size = cfg.size;
+            let ti = template(&mut cache, size);
+            for dy in -REFINE..=REFINE {
+                for dx in -REFINE..=REFINE {
+                    if let Some(d) = dtv_score(&gray, w, h, ox0 + dx, oy0 + dy, &cache[ti].1, size) {
+                        if best_tv.as_ref().map_or(true, |(b, _)| d > *b) {
+                            best_tv = Some((
+                                d,
+                                Detection {
+                                    ncc: d,
+                                    ox: ox0 + dx,
+                                    oy: oy0 + dy,
+                                    corner: "br",
+                                    size,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((d, det)) = best_tv {
+            if d >= DTV_ACCEPT {
+                return Some(det);
+            }
+        }
+    }
+
     winner.filter(|(a, _)| *a >= DETECT_THRESHOLD).map(|(_, d)| d)
 }
 
@@ -465,16 +589,85 @@ pub fn remove_at(
     out
 }
 
-/// Auto-estimate the opacity calibration (α-scale) for the mark at `(ox, oy)`:
-/// the strength at which the un-blended tile stops correlating with the
-/// watermark shape. When the built-in profile is *more* opaque than the mark
-/// actually is in a given image, the fixed 100 % removal over-subtracts white,
-/// leaving a dark, over-saturated patch; this finds the scale that lands the
-/// residual back on the background. Mirrors `calibrateStrength` in the web app.
-///
-/// The correlation of the residual with the α-shape is monotone-decreasing in
-/// `s`, so we scan `[0.30, 1.20]` and linearly interpolate the zero crossing.
+/// Auto-estimate the opacity calibration (α-scale) for the mark at `(ox, oy)`
+/// by paired-pixel regression: each strong-α pixel is paired with the nearest
+/// un-marked pixel along 8 directions as its local background estimate `b`,
+/// giving a direct per-pixel solve `s = (o − b) / (α (c − b))` from the blend
+/// model `o = b(1−αs) + c·αs`; the median over all pairs is the answer.
+/// Pairs whose background is too close to the mark colour are skipped — there
+/// the blend is insensitive to `s` (white mark on white background), which is
+/// also what makes this estimator robust to hard art edges crossing the tile
+/// (the failure mode of the residual-correlation method, kept as fallback).
+/// Mirrors `calibrateStrength` in the web app.
 pub fn calibrate_strength(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    map: &AlphaMap,
+    ox: i64,
+    oy: i64,
+    color: [u8; 3],
+) -> f32 {
+    let t = map.size;
+    let a = &map.a;
+    let lum_w = 0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32;
+    // Observed tile luminance (clamped sampling at image edges).
+    let mut o = vec![0f32; t * t];
+    for y in 0..t {
+        let gy = (oy + y as i64).clamp(0, h as i64 - 1) as usize;
+        for x in 0..t {
+            let gx = (ox + x as i64).clamp(0, w as i64 - 1) as usize;
+            let i = (gy * w + gx) * 4;
+            o[y * t + x] =
+                0.299 * src[i] as f32 + 0.587 * src[i + 1] as f32 + 0.114 * src[i + 2] as f32;
+        }
+    }
+    const DIRS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
+    let mut samples: Vec<f32> = Vec::new();
+    for y in 0..t {
+        for x in 0..t {
+            let av = a[y * t + x];
+            if av < 0.30 {
+                continue;
+            }
+            for (dx, dy) in DIRS {
+                let (mut cx, mut cy) = (x as i32, y as i32);
+                for _ in 0..40 {
+                    cx += dx;
+                    cy += dy;
+                    if cx < 0 || cy < 0 || cx >= t as i32 || cy >= t as i32 {
+                        break;
+                    }
+                    if a[cy as usize * t + cx as usize] < 0.02 {
+                        let b = o[cy as usize * t + cx as usize];
+                        if (lum_w - b).abs() >= 40.0 {
+                            samples.push((o[y * t + x] - b) / (av * (lum_w - b)));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if samples.len() >= 20 {
+        samples.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        let n = samples.len();
+        let med = if n % 2 == 1 {
+            samples[n / 2]
+        } else {
+            (samples[n / 2 - 1] + samples[n / 2]) / 2.0
+        };
+        return med.clamp(0.30, 1.20);
+    }
+    calibrate_strength_residual(src, w, h, map, ox, oy, color)
+}
+
+/// The pre-2026-07-22 auto-opacity: the strength at which the un-blended tile
+/// stops correlating with the watermark shape (monotone in `s`; scan
+/// `[0.30, 1.20]`, linear-interp the zero crossing). Accurate on unoccluded
+/// marks but misled by hard high-contrast edges inside the tile; kept only for
+/// tiles where paired-pixel regression finds too few usable pairs.
+fn calibrate_strength_residual(
     src: &[u8],
     w: usize,
     h: usize,
@@ -1059,6 +1252,96 @@ mod tests {
         assert!(
             (s - true_scale).abs() <= 0.15,
             "calibrated scale {s} vs true {true_scale}"
+        );
+    }
+
+    /// A hard high-contrast edge crossing the tile must not derail auto-opacity
+    /// (the residual-correlation method's failure mode on occluded marks).
+    #[test]
+    fn calibrate_robust_to_hard_edge() {
+        let map = default_map();
+        let (w, h) = (500usize, 400usize);
+        let t = 96usize;
+        let (ox, oy) = ((w - t - 64) as i64, (h - t - 64) as i64);
+        let true_scale = 0.6f32;
+        let mut obs = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                // hard vertical edge through the middle of the tile:
+                // near-black art on the left, bright background on the right
+                let v = if x < ox as usize + 40 { 8u8 } else { 210u8 };
+                obs[i] = v;
+                obs[i + 1] = v;
+                obs[i + 2] = v;
+                obs[i + 3] = 255;
+            }
+        }
+        for y in 0..t {
+            for x in 0..t {
+                let av = (map.a[y * t + x] * true_scale).min(0.98);
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let s = calibrate_strength(&obs, w, h, &map, ox, oy, [255, 255, 255]);
+        assert!(
+            (s - true_scale).abs() <= 0.12,
+            "calibrated scale {s} vs true {true_scale} despite hard edge"
+        );
+    }
+
+    /// A mark that is invisible over most of its footprint (white-on-white)
+    /// and crossed by black art defeats full-tile NCC; the TV-drop fallback
+    /// must still locate it at the 192px-margin catalog anchor.
+    #[test]
+    fn dtv_fallback_finds_occluded_mark() {
+        let map = default_map();
+        let (w, h) = (1400usize, 1200usize);
+        let t = 96usize;
+        // NEW_MARGIN_96 anchor for a large non-official size
+        let (ox, oy) = ((w - t - 192) as i64, (h - t - 192) as i64);
+        let mut obs = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                // bright page with mild deterministic grain + a black band
+                // crossing the right half of the tile
+                let grain = (((x * 7 + y * 13) % 5) as i32 - 2) as i32;
+                let v = if (1150..1190).contains(&x) {
+                    6i32
+                } else {
+                    (248 + grain).clamp(0, 255)
+                };
+                let v = v as u8;
+                obs[i] = v;
+                obs[i + 1] = v;
+                obs[i + 2] = v;
+                obs[i + 3] = 255;
+            }
+        }
+        for y in 0..t {
+            for x in 0..t {
+                let av = (map.a[y * t + x] * 0.6).min(0.98);
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let configs = crate::catalog::search_configs(w, h);
+        let det = detect_catalog(&obs, w, h, &map, &configs)
+            .expect("occluded mark must be found via the TV fallback");
+        assert_eq!(det.size, 96);
+        assert!(
+            (det.ox - ox).abs() <= 2 && (det.oy - oy).abs() <= 2,
+            "found ({},{}) vs true ({ox},{oy})",
+            det.ox,
+            det.oy
         );
     }
 
