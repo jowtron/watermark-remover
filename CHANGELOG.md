@@ -4,9 +4,21 @@ All notable changes to the Watermark Remover (web tool + Rust desktop app) are
 documented here. Format based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — web app
+## [Unreleased] — web app + desktop
 
 ### Added
+- **Auto-opacity.** Per-image opacity calibration (on by default) solves for the
+  mark's true strength instead of assuming 100%, fixing the dark/over-saturated
+  patch left when the profile is more opaque than a given image's mark.
+- **Soften mark edge** (toggle) — dissolves the faint residual outline the
+  profile's edge can leave.
+- **Rebuild flat background** (toggle) — on gradient/solid backgrounds, fits a
+  quadratic surface to the surrounding pixels and rebuilds the area under the
+  mark, fully clearing the ghost a single opacity can't. Gated by a flatness
+  test, so it never touches textured art.
+- **± opacity stepper buttons** for fine manual control next to the slider.
+- Shared 1:1 across the web app and the Rust desktop engine. Desktop also gains
+  a headless `--learn` profile-training CLI.
 - **Batch mode.** Drop multiple images on the Remove tab to clean them all
   in-browser and **download the results as a single ZIP** (store-only writer, no
   dependencies). Click any result to open it in the single-image editor.

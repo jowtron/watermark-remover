@@ -25,6 +25,10 @@ fn main() -> iced::Result {
         batch_main(&args);
         std::process::exit(0);
     }
+    if args.iter().any(|a| a == "--learn") {
+        learn_main(&args);
+        std::process::exit(0);
+    }
     iced::application("Watermark Remover", App::update, App::view)
         .subscription(App::subscription)
         .theme(App::theme)
@@ -32,13 +36,68 @@ fn main() -> iced::Result {
         .run_with(App::new)
 }
 
+/// Headless profile learning: `watermark-remover --learn <in_dir> [out_bin] [corner] [size]`.
+/// Blind-learns an α profile from a batch of watermarked images (default br/96),
+/// writes it as a raw `size*size` u8 `.bin` (α·255) plus a `<bin>.png` preview,
+/// and prints peak/footprint stats. Used to re-derive the built-in profile.
+fn learn_main(args: &[String]) {
+    let i = args.iter().position(|a| a == "--learn").unwrap();
+    let pos: Vec<&String> = args[i + 1..].iter().filter(|a| !a.starts_with("--")).collect();
+    let indir = pos.first().cloned().cloned().expect("usage: --learn <in_dir> [out_bin] [corner] [size]");
+    let out_bin = pos.get(1).cloned().cloned().unwrap_or_else(|| "learned96.bin".into());
+    let corner = pos.get(2).map(|s| s.as_str()).unwrap_or("br");
+    let size: usize = pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(96);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&indir)
+        .expect("cannot read input dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tiff")
+            )
+        })
+        .collect();
+    paths.sort();
+    let imgs: Vec<engine::LoadedImage> = paths
+        .iter()
+        .filter_map(|p| engine::load_image_from_path(p).ok())
+        .collect();
+    println!("learning {size}×{size} @{corner} from {} image(s) in {indir}", imgs.len());
+    match engine::learn(&imgs, corner, size) {
+        Some(m) => {
+            let peak = m.peak();
+            let foot = m.a.iter().filter(|&&v| v > 0.02).count();
+            let bytes: Vec<u8> = m.a.iter().map(|&v| (v * 255.0).round().clamp(0.0, 255.0) as u8).collect();
+            std::fs::write(&out_bin, &bytes).expect("write bin");
+            // preview PNG (grayscale α as RGBA)
+            let mut rgba = vec![0u8; size * size * 4];
+            for (k, &b) in bytes.iter().enumerate() {
+                rgba[k * 4] = b;
+                rgba[k * 4 + 1] = b;
+                rgba[k * 4 + 2] = b;
+                rgba[k * 4 + 3] = 255;
+            }
+            let png = format!("{out_bin}.png");
+            let _ = engine::save_png(std::path::Path::new(&png), &rgba, size, size);
+            println!("✔ peak α {peak:.3} · footprint {foot}px · wrote {out_bin} (+ {png})");
+        }
+        None => println!("learn failed (images too small for this size?)"),
+    }
+}
+
 /// Headless bulk removal: `watermark-remover --batch <in_dir> [out_dir]`.
 /// Uses the built-in Gemini profile, auto-locates and removes the mark in every
 /// image, and reports the detection confidence (NCC) per file.
 fn batch_main(args: &[String]) {
     let i = args.iter().position(|a| a == "--batch").unwrap();
-    let indir = args.get(i + 1).cloned().expect("usage: --batch <in_dir> [out_dir]");
-    let outdir = args.get(i + 2).cloned().unwrap_or_else(|| "clean-out".into());
+    // Positional args after --batch, skipping any --flags.
+    let pos: Vec<&String> = args[i + 1..].iter().filter(|a| !a.starts_with("--")).collect();
+    let indir = pos.first().cloned().cloned().expect("usage: --batch <in_dir> [out_dir]");
+    let outdir = pos.get(1).cloned().cloned().unwrap_or_else(|| "clean-out".into());
+    let calibrate = !args.iter().any(|a| a == "--no-calibrate");
+    let feather = !args.iter().any(|a| a == "--no-feather");
+    let reconstruct = !args.iter().any(|a| a == "--no-reconstruct");
     let _ = std::fs::create_dir_all(&outdir);
     let profile = Profile::with_default();
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&indir)
@@ -65,14 +124,26 @@ fn batch_main(args: &[String]) {
                 match auto_detect(&profile, &img.rgba, img.w, img.h) {
                     Some(d) => {
                         let map = removal_map(&profile, d.size);
-                        let out =
-                            engine::remove_at(&img.rgba, img.w, img.h, &map, d.ox, d.oy, [255, 255, 255], 1.0);
+                        let color = [255u8, 255, 255];
+                        let strength = if calibrate {
+                            engine::calibrate_strength(&img.rgba, img.w, img.h, &map, d.ox, d.oy, color)
+                        } else {
+                            1.0
+                        };
+                        let mut out =
+                            engine::remove_at(&img.rgba, img.w, img.h, &map, d.ox, d.oy, color, strength);
+                        if feather {
+                            engine::feather_edges(&mut out, img.w, img.h, &map, d.ox, d.oy);
+                        }
+                        if reconstruct {
+                            engine::reconstruct_flat(&mut out, img.w, img.h, &map, d.ox, d.oy);
+                        }
                         let stem = p.file_stem().unwrap().to_string_lossy();
                         let outp = std::path::Path::new(&outdir).join(format!("{stem}-clean.png"));
                         let _ = engine::save_png(&outp, &out, img.w, img.h);
                         println!(
-                            "{:48} {:>5}x{:<5} {} ({},{}) ncc {:.3}",
-                            fname, img.w, img.h, d.corner, d.ox, d.oy, d.ncc
+                            "{:44} {:>5}x{:<5} {} ({},{}) ncc {:.3} opac {:.0}%",
+                            fname, img.w, img.h, d.corner, d.ox, d.oy, d.ncc, strength * 100.0
                         );
                         ok += 1;
                     }
@@ -199,6 +270,10 @@ enum Message {
     NudgeY(String),
     Color(String),
     Strength(i32),
+    StrengthStep(i32),
+    ToggleAuto(bool),
+    ToggleFeather(bool),
+    ToggleReconstruct(bool),
     ToggleOutline(bool),
     ToggleBefore(bool),
     ToggleZoom(bool),
@@ -230,6 +305,10 @@ struct App {
     nudge_y: String,
     color_hex: String,
     strength: i32,
+    last_strength_pct: i32, // opacity actually used last run (auto or manual)
+    auto_opacity: bool,
+    feather: bool,
+    reconstruct: bool,
     show_outline: bool,
     show_before: bool,
     show_zoom: bool,
@@ -276,6 +355,10 @@ impl App {
             nudge_y: "0".into(),
             color_hex: "#ffffff".into(),
             strength,
+            last_strength_pct: strength,
+            auto_opacity: true,
+            feather: true,
+            reconstruct: true,
             show_outline: true,
             show_before: false,
             show_zoom: false,
@@ -333,7 +416,29 @@ impl App {
             }
             Message::Strength(v) => {
                 self.strength = v;
+                self.auto_opacity = false; // moving the slider means manual control
                 save_strength(v);
+                self.run_removal();
+            }
+            Message::StrengthStep(d) => {
+                // Step from whatever opacity was last applied (so the first nudge
+                // off "auto" continues from the auto-picked value, not the slider).
+                let base = self.last_strength_pct;
+                self.strength = (base + d).clamp(20, 220);
+                self.auto_opacity = false;
+                save_strength(self.strength);
+                self.run_removal();
+            }
+            Message::ToggleAuto(b) => {
+                self.auto_opacity = b;
+                self.run_removal();
+            }
+            Message::ToggleFeather(b) => {
+                self.feather = b;
+                self.run_removal();
+            }
+            Message::ToggleReconstruct(b) => {
+                self.reconstruct = b;
                 self.run_removal();
             }
             Message::ToggleOutline(b) => {
@@ -553,21 +658,37 @@ impl App {
         ox += self.nudge_x.trim().parse::<i64>().unwrap_or(0);
         oy += self.nudge_y.trim().parse::<i64>().unwrap_or(0);
         let color = parse_hex(&self.color_hex).unwrap_or([255, 255, 255]);
-        let strength = self.strength as f32 / 100.0;
         let map = removal_map(&self.profile, used_size);
-        let out = engine::remove_at(&src.rgba, w, h, &map, ox, oy, color, strength);
+        let strength = if self.auto_opacity {
+            engine::calibrate_strength(&src.rgba, w, h, &map, ox, oy, color)
+        } else {
+            self.strength as f32 / 100.0
+        };
+        self.last_strength_pct = (strength * 100.0).round() as i32;
+        let mut out = engine::remove_at(&src.rgba, w, h, &map, ox, oy, color, strength);
+        if self.feather {
+            engine::feather_edges(&mut out, w, h, &map, ox, oy);
+        }
+        if self.reconstruct {
+            engine::reconstruct_flat(&mut out, w, h, &map, ox, oy);
+        }
         self.result = Some(RemovalResult {
             rgba: out,
             ox,
             oy,
             size: used_size,
         });
+        let opac = format!(
+            " · opacity {:.0}%{}",
+            strength * 100.0,
+            if self.auto_opacity { " (auto)" } else { "" }
+        );
         self.det_info = match ncc {
             Some(n) => format!(
-                "Region {used_size}×{used_size} at {corner} ({ox},{oy}) · match {n:.2}{}",
-                if n < 0.15 { "  (low — adjust manually)" } else { "" }
+                "Region {used_size}×{used_size} at {corner} ({ox},{oy}) · match {n:.2}{}{opac}",
+                if n < 0.15 { "  (low match)" } else { "" }
             ),
-            None => format!("Region {used_size}×{used_size} at {corner} ({ox},{oy}) · manual"),
+            None => format!("Region {used_size}×{used_size} at {corner} ({ox},{oy}) · manual{opac}"),
         };
         self.rebuild_result_preview();
     }
@@ -840,14 +961,36 @@ impl App {
                                 .into()
                         ),
                         labeled_input(
-                            &format!("Opacity calibration  {}%", self.strength),
-                            slider(20..=220, self.strength, Message::Strength)
-                                .width(Length::Fixed(220.0))
-                                .into()
+                            &if self.auto_opacity {
+                                format!("Opacity  auto ({}%)", self.last_strength_pct)
+                            } else {
+                                format!("Opacity  {}%", self.strength)
+                            },
+                            row![
+                                button(text("−").size(16))
+                                    .padding([2, 10])
+                                    .on_press(Message::StrengthStep(-1)),
+                                slider(20..=220, self.strength, Message::Strength)
+                                    .width(Length::Fixed(170.0)),
+                                button(text("+").size(16))
+                                    .padding([2, 10])
+                                    .on_press(Message::StrengthStep(1)),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center)
+                            .into()
                         ),
                     ]
                     .spacing(16)
                     .align_y(Alignment::End),
+                    row![
+                        checkbox("auto opacity", self.auto_opacity).on_toggle(Message::ToggleAuto),
+                        checkbox("soften mark edge", self.feather).on_toggle(Message::ToggleFeather),
+                        checkbox("rebuild flat background", self.reconstruct)
+                            .on_toggle(Message::ToggleReconstruct),
+                    ]
+                    .spacing(16)
+                    .align_y(Alignment::Center),
                     text(&self.det_info).size(12).style(muted),
                 ]
                 .spacing(10),

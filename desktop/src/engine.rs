@@ -465,6 +465,335 @@ pub fn remove_at(
     out
 }
 
+/// Auto-estimate the opacity calibration (α-scale) for the mark at `(ox, oy)`:
+/// the strength at which the un-blended tile stops correlating with the
+/// watermark shape. When the built-in profile is *more* opaque than the mark
+/// actually is in a given image, the fixed 100 % removal over-subtracts white,
+/// leaving a dark, over-saturated patch; this finds the scale that lands the
+/// residual back on the background. Mirrors `calibrateStrength` in the web app.
+///
+/// The correlation of the residual with the α-shape is monotone-decreasing in
+/// `s`, so we scan `[0.30, 1.20]` and linearly interpolate the zero crossing.
+pub fn calibrate_strength(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    map: &AlphaMap,
+    ox: i64,
+    oy: i64,
+    color: [u8; 3],
+) -> f32 {
+    let t = map.size;
+    let a = &map.a;
+    let a_mean = map.mean;
+    let lum_w = 0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32;
+    // Observed tile luminance (clamped sampling at image edges).
+    let mut o = vec![0f32; t * t];
+    for y in 0..t {
+        let gy = (oy + y as i64).clamp(0, h as i64 - 1) as usize;
+        for x in 0..t {
+            let gx = (ox + x as i64).clamp(0, w as i64 - 1) as usize;
+            let i = (gy * w + gx) * 4;
+            o[y * t + x] =
+                0.299 * src[i] as f32 + 0.587 * src[i + 1] as f32 + 0.114 * src[i + 2] as f32;
+        }
+    }
+    let r = ((t as f32 * 0.10).round() as usize).max(4);
+    let a_ss: f32 = a.iter().map(|v| (v - a_mean) * (v - a_mean)).sum();
+    // NCC of the high-passed corrected tile against the α-shape at scale `s`.
+    let corr_at = |s: f32| -> f32 {
+        let mut cor = vec![0f32; t * t];
+        for i in 0..t * t {
+            let av = (a[i] * s).min(0.98);
+            cor[i] = (o[i] - lum_w * av) / (1.0 - av);
+        }
+        let blur = box_blur(&cor, t, t, r);
+        let mut hp = vec![0f32; t * t];
+        for i in 0..t * t {
+            hp[i] = cor[i] - blur[i];
+        }
+        let hp_mean = mean(&hp);
+        let (mut num, mut dh) = (0f32, 0f32);
+        for i in 0..t * t {
+            let x = hp[i] - hp_mean;
+            num += x * (a[i] - a_mean);
+            dh += x * x;
+        }
+        let den = (dh * a_ss).sqrt();
+        if den > 1e-8 {
+            num / den
+        } else {
+            0.0
+        }
+    };
+    let (lo, hi, step) = (0.30f32, 1.20f32, 0.05f32);
+    let mut prev_s = lo;
+    let mut prev_c = corr_at(lo);
+    if prev_c <= 0.0 {
+        return lo; // mark already fainter than 0.30·profile
+    }
+    let mut s = lo + step;
+    while s <= hi + 1e-4 {
+        let c = corr_at(s);
+        if c <= 0.0 {
+            let f = prev_c / (prev_c - c);
+            return (prev_s + f * (s - prev_s)).clamp(lo, hi);
+        }
+        prev_s = s;
+        prev_c = c;
+        s += step;
+    }
+    hi // still correlated at 1.20 → mark stronger than profile; cap
+}
+
+/// Optional cosmetic pass over the removed tile: dissolve the faint residual
+/// **outline** that survives when the profile's edge doesn't perfectly match the
+/// mark, by locally averaging RGB within the α edge-band (weight ∝ |∇α|). A
+/// toggle — it very slightly softens real image lines crossing the mark. Mirrors
+/// `featherEdges` in the web app.
+pub fn feather_edges(out: &mut [u8], w: usize, h: usize, map: &AlphaMap, ox: i64, oy: i64) {
+    let t = map.size;
+    let a = &map.a;
+    // |∇α|, widened by a 3×3 max and normalized → per-pixel feather weight.
+    let mut g = vec![0f32; t * t];
+    let mut gmax = 1e-6f32;
+    for y in 0..t {
+        for x in 0..t {
+            let xm = x.saturating_sub(1);
+            let xp = (x + 1).min(t - 1);
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(t - 1);
+            let gx = a[y * t + xp] - a[y * t + xm];
+            let gy = a[yp * t + x] - a[ym * t + x];
+            let m = (gx * gx + gy * gy).sqrt();
+            g[y * t + x] = m;
+            if m > gmax {
+                gmax = m;
+            }
+        }
+    }
+    let mut wt = vec![0f32; t * t];
+    for y in 0..t {
+        for x in 0..t {
+            let mut mx = 0f32;
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let yy = (y as i64 + dy).clamp(0, t as i64 - 1) as usize;
+                    let xx = (x as i64 + dx).clamp(0, t as i64 - 1) as usize;
+                    mx = mx.max(g[yy * t + xx]);
+                }
+            }
+            wt[y * t + x] = (mx / gmax).min(1.0);
+        }
+    }
+    let sample = |gx: i64, gy: i64, c: usize| -> f32 {
+        let sx = gx.clamp(0, w as i64 - 1) as usize;
+        let sy = gy.clamp(0, h as i64 - 1) as usize;
+        out[(sy * w + sx) * 4 + c] as f32
+    };
+    // Compute all new values from the *current* buffer, then write back, so the
+    // 3×3 average never reads already-feathered neighbours.
+    let mut newv = vec![0u8; t * t * 3];
+    for y in 0..t {
+        let gyc = oy + y as i64;
+        for x in 0..t {
+            let gxc = ox + x as i64;
+            if gyc < 0 || gyc >= h as i64 || gxc < 0 || gxc >= w as i64 {
+                continue;
+            }
+            let ww = wt[y * t + x];
+            for c in 0..3 {
+                let orig = sample(gxc, gyc, c);
+                if ww <= 0.02 {
+                    newv[(y * t + x) * 3 + c] = orig.round() as u8;
+                    continue;
+                }
+                let mut acc = 0f32;
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        acc += sample(gxc + dx, gyc + dy, c);
+                    }
+                }
+                let blur = acc / 9.0;
+                newv[(y * t + x) * 3 + c] =
+                    clampf(orig * (1.0 - ww) + blur * ww, 0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    for y in 0..t {
+        let gyc = oy + y as i64;
+        for x in 0..t {
+            let gxc = ox + x as i64;
+            if gyc < 0 || gyc >= h as i64 || gxc < 0 || gxc >= w as i64 {
+                continue;
+            }
+            let i = ((gyc as usize) * w + gxc as usize) * 4;
+            for c in 0..3 {
+                out[i + c] = newv[(y * t + x) * 3 + c];
+            }
+        }
+    }
+}
+
+/// Reconstruct a smooth background under the mark when the surrounding area is
+/// flat (a gradient or solid fill), by fitting a quadratic surface to the
+/// un-marked pixels and blending it over the mark footprint. On smooth
+/// backgrounds a single α-scale can't be exact, so the plain un-blend leaves a
+/// faint ghost outline; rebuilding the surface removes it entirely. A flatness
+/// gate makes this a **no-op on textured art** (e.g. waves), so it never
+/// invents detail. Mirrors `reconstructFlat` in the web app. Runs after
+/// `remove_at` (and any feather), mutating `out` in place.
+pub fn reconstruct_flat(out: &mut [u8], w: usize, h: usize, map: &AlphaMap, ox: i64, oy: i64) {
+    let t = map.size;
+    let a = &map.a;
+    let pad = 22usize;
+    let (ww, wh) = (t + 2 * pad, t + 2 * pad);
+    let (wx0, wy0) = (ox - pad as i64, oy - pad as i64);
+    // Snapshot the padded window RGB (clamped at image edges) so the fit reads a
+    // stable copy while we later mutate `out`.
+    let mut win = vec![0f32; ww * wh * 3];
+    for ly in 0..wh {
+        for lx in 0..ww {
+            let gx = (wx0 + lx as i64).clamp(0, w as i64 - 1) as usize;
+            let gy = (wy0 + ly as i64).clamp(0, h as i64 - 1) as usize;
+            let si = (gy * w + gx) * 4;
+            for c in 0..3 {
+                win[(ly * ww + lx) * 3 + c] = out[si + c] as f32;
+            }
+        }
+    }
+    let lum_at = |i: usize| -> f32 { 0.299 * win[i * 3] + 0.587 * win[i * 3 + 1] + 0.114 * win[i * 3 + 2] };
+    let mut lum = vec![0f32; ww * wh];
+    for i in 0..ww * wh {
+        lum[i] = lum_at(i);
+    }
+    let blur = box_blur(&lum, ww, wh, 7);
+    // Flatness = 1 when the ring around the tile is smooth, → 0 when textured.
+    let (mut s, mut ss, mut n) = (0f64, 0f64, 0usize);
+    for ly in 0..wh {
+        for lx in 0..ww {
+            if lx >= pad && lx < pad + t && ly >= pad && ly < pad + t {
+                continue; // skip the tile interior (holds the mark residual)
+            }
+            let hp = (lum[ly * ww + lx] - blur[ly * ww + lx]) as f64;
+            s += hp;
+            ss += hp * hp;
+            n += 1;
+        }
+    }
+    let mean = s / n as f64;
+    let flat = (ss / n as f64 - mean * mean).max(0.0).sqrt() as f32;
+    let flatness = (1.0 - (flat - 2.5) / 7.0).clamp(0.0, 1.0);
+    if flatness <= 0.05 {
+        return; // textured background — leave the un-blend untouched
+    }
+    // Footprint weight: the star mask, soft-dilated and feathered.
+    let mut fp = vec![0f32; ww * wh];
+    for ly in 0..wh {
+        for lx in 0..ww {
+            if lx >= pad && lx < pad + t && ly >= pad && ly < pad + t
+                && a[(ly - pad) * t + (lx - pad)] > 0.03
+            {
+                fp[ly * ww + lx] = 1.0;
+            }
+        }
+    }
+    let fp = box_blur(&fp, ww, wh, 2);
+    let fp: Vec<f32> = fp.iter().map(|v| (v * 1.6).min(1.0)).collect();
+    // Quadratic surface fit on the known background (fp < 0.10) via normal
+    // equations. Basis [1, x, y, x², y², xy] with coords scaled to keep the
+    // system well-conditioned.
+    let basis = |lx: usize, ly: usize| -> [f64; 6] {
+        let x = (lx as f64 - ww as f64 / 2.0) / 100.0;
+        let y = (ly as f64 - wh as f64 / 2.0) / 100.0;
+        [1.0, x, y, x * x, y * y, x * y]
+    };
+    let mut ata = [[0f64; 6]; 6];
+    let mut atb = [[0f64; 3]; 6];
+    for ly in 0..wh {
+        for lx in 0..ww {
+            if fp[ly * ww + lx] >= 0.10 {
+                continue;
+            }
+            let b = basis(lx, ly);
+            let px = (ly * ww + lx) * 3;
+            for i in 0..6 {
+                for j in 0..6 {
+                    ata[i][j] += b[i] * b[j];
+                }
+                for c in 0..3 {
+                    atb[i][c] += b[i] * win[px + c] as f64;
+                }
+            }
+        }
+    }
+    // Gaussian elimination with partial pivoting, solving all 3 channels at once.
+    let (mut m, mut rhs) = (ata, atb);
+    for col in 0..6 {
+        let mut piv = col;
+        for r in col + 1..6 {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col].abs() < 1e-9 {
+            return; // singular (degenerate window) → skip reconstruction
+        }
+        m.swap(col, piv);
+        rhs.swap(col, piv);
+        let d = m[col][col];
+        for j in 0..6 {
+            m[col][j] /= d;
+        }
+        for c in 0..3 {
+            rhs[col][c] /= d;
+        }
+        for r in 0..6 {
+            if r == col {
+                continue;
+            }
+            let f = m[r][col];
+            if f == 0.0 {
+                continue;
+            }
+            for j in 0..6 {
+                m[r][j] -= f * m[col][j];
+            }
+            for c in 0..3 {
+                rhs[r][c] -= f * rhs[col][c];
+            }
+        }
+    }
+    // Evaluate the fitted surface and blend it in over the footprint.
+    for ly in 0..wh {
+        let gy = wy0 + ly as i64;
+        if gy < 0 || gy >= h as i64 {
+            continue;
+        }
+        for lx in 0..ww {
+            let wgt = fp[ly * ww + lx] * flatness;
+            if wgt <= 0.002 {
+                continue;
+            }
+            let gx = wx0 + lx as i64;
+            if gx < 0 || gx >= w as i64 {
+                continue;
+            }
+            let b = basis(lx, ly);
+            let i = ((gy as usize) * w + gx as usize) * 4;
+            for c in 0..3 {
+                let mut surf = 0f64;
+                for k in 0..6 {
+                    surf += b[k] * rhs[k][c];
+                }
+                let base = out[i + c] as f32;
+                out[i + c] =
+                    clampf(base * (1.0 - wgt) + surf as f32 * wgt, 0.0, 255.0).round() as u8;
+            }
+        }
+    }
+}
+
 /// Blind-learn an α profile from a batch of watermarked images using a
 /// per-pixel low percentile (no clean originals, no labels). Mirrors the
 /// `learnBtn` handler in the web app.
@@ -691,6 +1020,127 @@ mod tests {
             detect_catalog(&clean, w, h, &map, &configs).is_none(),
             "detector fired on a clean image"
         );
+    }
+
+    /// Composite the mark at a known opacity *scale* (0.6) over textured
+    /// content, then check the auto-calibrator recovers roughly that scale —
+    /// the guard that removal won't over-subtract when the mark is fainter than
+    /// the stored profile.
+    #[test]
+    fn calibrate_recovers_known_scale() {
+        let map = default_map();
+        let (w, h) = (600usize, 500usize);
+        let t = 96usize;
+        let (ox, oy) = ((w - t - 64) as i64, (h - t - 64) as i64);
+        let true_scale = 0.6f32;
+        let mut obs = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                // low-frequency, watermark-uncorrelated background
+                let v = (120.0 + 60.0 * ((x as f32 / 40.0).sin() + (y as f32 / 55.0).cos())) as u8;
+                obs[i] = v;
+                obs[i + 1] = v.wrapping_add(15);
+                obs[i + 2] = v.wrapping_sub(10);
+                obs[i + 3] = 255;
+            }
+        }
+        for y in 0..t {
+            for x in 0..t {
+                let av = (map.a[y * t + x] * true_scale).min(0.98);
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let s = calibrate_strength(&obs, w, h, &map, ox, oy, [255, 255, 255]);
+        assert!(
+            (s - true_scale).abs() <= 0.15,
+            "calibrated scale {s} vs true {true_scale}"
+        );
+    }
+
+    /// `reconstruct_flat` must rebuild a smooth gradient under the mark (removing
+    /// the ghost) but leave a **textured** background untouched (its flatness
+    /// gate is the guard against inventing detail over real art).
+    #[test]
+    fn reconstruct_flat_rebuilds_smooth_and_skips_textured() {
+        let map = default_map();
+        let (w, h) = (400usize, 300usize);
+        let t = 96usize;
+        let (ox, oy) = (200i64, 130i64);
+        // --- smooth linear gradient: mark composited then removed at a wrong
+        //     (too-strong) scale to leave a residual ghost; reconstruction should
+        //     pull the footprint back onto the gradient.
+        let mut smooth = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = (40.0 + 0.25 * x as f32 + 0.15 * y as f32).min(255.0) as u8;
+                smooth[i] = v;
+                smooth[i + 1] = v;
+                smooth[i + 2] = v;
+                smooth[i + 3] = 255;
+            }
+        }
+        let clean = smooth.clone();
+        // composite the mark, then remove 20% too strong → residual ghost
+        let mut obs = smooth.clone();
+        for y in 0..t {
+            for x in 0..t {
+                let av = map.a[y * t + x];
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let mut out = remove_at(&obs, w, h, &map, ox, oy, [255, 255, 255], 1.2);
+        let ghost_before = footprint_err(&out, &clean, w, &map, ox, oy);
+        reconstruct_flat(&mut out, w, h, &map, ox, oy);
+        let ghost_after = footprint_err(&out, &clean, w, &map, ox, oy);
+        assert!(
+            ghost_after < ghost_before * 0.5,
+            "reconstruction should roughly halve the residual: {ghost_before:.1} → {ghost_after:.1}"
+        );
+
+        // --- high-frequency texture: reconstruction must be a no-op.
+        let mut tex = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = (((x * 37 + y * 53) % 2) * 200 + 30) as u8; // checker-ish
+                tex[i] = v;
+                tex[i + 1] = v;
+                tex[i + 2] = v;
+                tex[i + 3] = 255;
+            }
+        }
+        let before = tex.clone();
+        reconstruct_flat(&mut tex, w, h, &map, ox, oy);
+        assert_eq!(before, tex, "reconstruction fired on textured background");
+    }
+
+    /// Mean per-channel error inside the mark footprint vs a clean reference.
+    fn footprint_err(out: &[u8], clean: &[u8], w: usize, map: &AlphaMap, ox: i64, oy: i64) -> f32 {
+        let t = map.size;
+        let (mut sum, mut n) = (0f32, 0usize);
+        for y in 0..t {
+            for x in 0..t {
+                if map.a[y * t + x] <= 0.05 {
+                    continue;
+                }
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    sum += (out[i + c] as f32 - clean[i + c] as f32).abs();
+                    n += 1;
+                }
+            }
+        }
+        sum / n as f32
     }
 
     #[test]
