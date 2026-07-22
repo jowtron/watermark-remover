@@ -412,19 +412,23 @@ function pickSize(){ const sizes=Object.keys(MAPS).map(Number).filter(Number.isF
   if(SRC){ const want=(SRC.width>=1024&&SRC.height>=1024)?96:48; if(MAPS[want])return want; } return sizes[0]; }
 function showSingle(){ $('#batch').style.display='none'; $('#controls').style.display=''; $('#result').style.display=''; }
 function showBatch(){ $('#batch').style.display=''; $('#controls').style.display='none'; $('#result').style.display='none'; }
+/* A placement (corner + nudge, e.g. from click-to-place) is specific to one
+   image — always start the next image from auto-detect. */
+function resetPlacement(){ $('#corner').value='auto'; $('#nudgeX').value=0; $('#nudgeY').value=0; LAST_SOFTNESS=0; }
 wireDrop($('#drop'),$('#file'),async fs=>{ if(!fs.length)return; if(!Object.keys(MAPS).length){$('#status').innerHTML='<span class="badge bad">Set a watermark profile first (Watermark tab).</span>';return;}
-  if(fs.length===1){ $('#status').textContent='Loading…'; SRC=await fileToImageData(fs[0]); $('#status').innerHTML=`<b>${SRC.name}</b> — ${SRC.width}×${SRC.height}`; showSingle(); run(); }
+  if(fs.length===1){ $('#status').textContent='Loading…'; SRC=await fileToImageData(fs[0]); $('#status').innerHTML=`<b>${SRC.name}</b> — ${SRC.width}×${SRC.height}`; resetPlacement(); showSingle(); run(); }
   else { runBatch(fs); } });
 
 /* ---- batch: clean many images, download as a ZIP (all in-browser) ---- */
 let BATCH=[];
-let LAST_STRENGTH_PCT=100;
+let LAST_STRENGTH_PCT=100,LAST_SOFTNESS=0;
 /* run detection+removal on a loaded image (SRC-shaped {data,width,height,name}) */
 function processSrc(srcObj,strength){ const prev=SRC; SRC=srcObj;
   let det = MAPS[96] ? detectCatalog() : detect(pickSize());
   let out=null;
-  if(det){ const map=mapForSize(det.size),W255=[255,255,255];
-    const st=$('#autoOpac').checked?calibrateStrength(map,det.ox,det.oy,W255):strength;
+  if(det){ let map=mapForSize(det.size); const W255=[255,255,255];
+    let st=strength;
+    if($('#autoOpac').checked){ const fit=calibrateFit(map,det.ox,det.oy,W255); st=fit[0]; map=softenMap(map,fit[1]); }
     out=removeAt(map,det.ox,det.oy,W255,st); if($('#feather').checked)featherEdges(out,det.ox,det.oy,map);
     if($('#reconstruct').checked)reconstructFlat(out,det.ox,det.oy,map); }
   SRC=prev; return {out,det}; }
@@ -445,7 +449,7 @@ async function runBatch(fs){ showBatch(); BATCH=[]; const grid=$('#batchGrid'); 
     meta.innerHTML=`<div class="nm">${entry.name}</div>`+(det?`<span class="badge ok" style="margin-top:4px">cleaned · ${det.size}px</span>`:`<span class="badge bad" style="margin-top:4px">no mark found</span>`);
     card.appendChild(cv); card.appendChild(meta);
     card.title='Click to fine-tune in the single-image editor';
-    card.onclick=()=>{ SRC=entry.src; showSingle(); $('#status').innerHTML=`<b>${entry.name}</b> — ${SRC.width}×${SRC.height}`; run(); document.querySelector('#controls').scrollIntoView({behavior:'smooth',block:'nearest'}); };
+    card.onclick=()=>{ SRC=entry.src; resetPlacement(); showSingle(); $('#status').innerHTML=`<b>${entry.name}</b> — ${SRC.width}×${SRC.height}`; run(); document.querySelector('#controls').scrollIntoView({behavior:'smooth',block:'nearest'}); };
     grid.appendChild(card); done++; $('#batchStatus').textContent=`processing ${done}/${fs.length}…`;
     await new Promise(r=>setTimeout(r,0)); // let the UI paint between images
   }
@@ -592,18 +596,50 @@ function removeAt(map,ox,oy,W255,strength){ const {width:W,height:H}=SRC,T=map.s
    white background), which is also what makes this robust to hard art edges
    crossing the tile (the failure mode of the residual-correlation method
    below, kept as fallback for tiles with too few usable pairs). */
-function calibrateStrength(map,ox,oy,W255){ const {width:W,height:H}=SRC,s=SRC.data.data,T=map.size,A=map.a;
+function calibrateStrength(map,ox,oy,W255){ return calibrateFit(map,ox,oy,W255)[0]; }
+/* 3×3 box blur of a square α-map (edge-clamped) — the "softened" template. */
+function box3Alpha(A,T){ const o=new Float32Array(T*T);
+  for(let y=0;y<T;y++)for(let x=0;x<T;x++){ let s=0;
+    for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){ const yy=Math.min(T-1,Math.max(0,y+dy)),xx=Math.min(T-1,Math.max(0,x+dx)); s+=A[yy*T+xx]; }
+    o[y*T+x]=s/9; } return o; }
+/* The profile blended toward its 3×3 box blur by softness ∈ [0,1]. Some Gemini
+   cohorts stamp a slightly softer-edged star than the measured template
+   (resampled rendering); removal with the raw template then leaves a bright rim
+   (edge under-removed) and a dark inner ring. calibrateFit measures the blend. */
+function softenMap(map,softness){ if(softness<=0)return map;
+  const b=box3Alpha(map.a,map.size),a=new Float32Array(map.a.length);
+  for(let i=0;i<a.length;i++)a[i]=map.a[i]*(1-softness)+b[i]*softness;
+  return{size:map.size,a}; }
+/* Jointly fit [strength, edge softness] by paired-pixel regression: each marked
+   pixel pairs with the nearest un-marked pixel along 8 directions as its local
+   background estimate b, solving o=b(1-αs)+c·αs → s=(o-b)/(α(c-b)). For each
+   candidate softness the strength is the median solve over the star core
+   (α≥0.30); the winning softness leaves the smallest median |residual| across
+   all pairs (edge-dominated). Pairs with background ≈ mark colour are skipped —
+   the blend is insensitive to s there, which also makes this robust to hard art
+   edges crossing the tile (the failure mode of the residual-correlation method
+   below, kept as fallback for tiles with too few usable pairs). */
+function calibrateFit(map,ox,oy,W255){ const {width:W,height:H}=SRC,s=SRC.data.data,T=map.size;
   const lumW=0.299*W255[0]+0.587*W255[1]+0.114*W255[2], cl=(v,hi)=>v<0?0:(v>=hi?hi-1:v);
   const O=new Float32Array(T*T);
   for(let y=0;y<T;y++){const gy=cl(oy+y,H);for(let x=0;x<T;x++){const gx=cl(ox+x,W),i=(gy*W+gx)*4;O[y*T+x]=0.299*s[i]+0.587*s[i+1]+0.114*s[i+2];}}
-  const DIRS=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]],samples=[];
-  for(let y=0;y<T;y++)for(let x=0;x<T;x++){ const av=A[y*T+x]; if(av<0.30)continue;
-    for(const [dx,dy] of DIRS){ let cx=x,cy=y;
-      for(let st=0;st<40;st++){ cx+=dx;cy+=dy; if(cx<0||cy<0||cx>=T||cy>=T)break;
-        if(A[cy*T+cx]<0.02){ const b=O[cy*T+cx]; if(Math.abs(lumW-b)>=40)samples.push((O[y*T+x]-b)/(av*(lumW-b))); break; } } } }
-  if(samples.length>=20){ samples.sort((p,q)=>p-q); const n=samples.length,med=n%2?samples[(n-1)/2]:(samples[n/2-1]+samples[n/2])/2;
-    return Math.min(1.20,Math.max(0.30,med)); }
-  return calibrateStrengthResidual(map,ox,oy,W255); }
+  const DIRS=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]], box3=box3Alpha(map.a,T);
+  const median=v=>{ v.sort((p,q)=>p-q); const n=v.length; return n%2?v[(n-1)/2]:(v[n/2-1]+v[n/2])/2; };
+  let best=null;
+  for(let step=0;step<=4;step++){ const soft=step*0.25;
+    const A=new Float32Array(T*T); for(let i=0;i<T*T;i++)A[i]=map.a[i]*(1-soft)+box3[i]*soft;
+    const pairs=[];
+    for(let y=0;y<T;y++)for(let x=0;x<T;x++){ const av=A[y*T+x]; if(av<0.05)continue;
+      for(const [dx,dy] of DIRS){ let cx=x,cy=y;
+        for(let st=0;st<40;st++){ cx+=dx;cy+=dy; if(cx<0||cy<0||cx>=T||cy>=T)break;
+          if(A[cy*T+cx]<0.02){ const b=O[cy*T+cx]; if(Math.abs(lumW-b)>=40)pairs.push([av,O[y*T+x],b]); break; } } } }
+    const core=pairs.filter(p=>p[0]>=0.30).map(([av,ov,b])=>(ov-b)/(av*(lumW-b)));
+    if(core.length<20)continue;
+    const st=Math.min(1.20,Math.max(0.30,median(core)));
+    const r=median(pairs.map(([av,ov,b])=>Math.abs(ov-b-av*st*(lumW-b))));
+    if(!best||r<best[0])best=[r,st,soft]; }
+  if(best)return[best[1],best[2]];
+  return[calibrateStrengthResidual(map,ox,oy,W255),0]; }
 /* The pre-2026-07-22 auto-opacity: the strength at which the un-blended tile
    stops correlating with the watermark shape. Accurate on unoccluded marks but
    misled by hard high-contrast edges inside the tile; kept as fallback.
@@ -655,9 +691,14 @@ function reconstructFlat(out,ox,oy,map){ const {width:W,height:H}=SRC,d=out.data
   const win=new Float32Array(ww*wh*3);
   for(let ly=0;ly<wh;ly++)for(let lx=0;lx<ww;lx++){ const gx=cl(wx0+lx,W),gy=cl(wy0+ly,H),si=(gy*W+gx)*4,di=(ly*ww+lx)*3; win[di]=d[si];win[di+1]=d[si+1];win[di+2]=d[si+2]; }
   const lum=new Float32Array(ww*wh); for(let i=0;i<ww*wh;i++)lum[i]=0.299*win[i*3]+0.587*win[i*3+1]+0.114*win[i*3+2];
-  const blur=boxBlur(lum,ww,wh,7); let s=0,ss=0,n=0;
-  for(let ly=0;ly<wh;ly++)for(let lx=0;lx<ww;lx++){ if(lx>=pad&&lx<pad+t&&ly>=pad&&ly<pad+t)continue; const hp=lum[ly*ww+lx]-blur[ly*ww+lx]; s+=hp;ss+=hp*hp;n++; }
-  const mean=s/n, flat=Math.sqrt(Math.max(0,ss/n-mean*mean)), flatness=Math.min(1,Math.max(0,1-(flat-2.5)/7));
+  const blur=boxBlur(lum,ww,wh,7); let s=0,ss=0,lsum=0,n=0;
+  for(let ly=0;ly<wh;ly++)for(let lx=0;lx<ww;lx++){ if(lx>=pad&&lx<pad+t&&ly>=pad&&ly<pad+t)continue; const hp=lum[ly*ww+lx]-blur[ly*ww+lx]; s+=hp;ss+=hp*hp;lsum+=lum[ly*ww+lx];n++; }
+  const mean=s/n, flat=Math.sqrt(Math.max(0,ss/n-mean*mean));
+  /* absolute σ misreads dark textured art as flat (σ is small only because the
+     pixels are dark) — also require low contrast-relative texture, or the
+     surface fit wipes real texture under the mark */
+  const rel=flat/(lsum/n+12);
+  const flatness=Math.min(1,Math.max(0,1-(flat-2.5)/7))*Math.min(1,Math.max(0,(0.12-rel)/0.09));
   if(flatness<=0.05)return;
   let fp=new Float32Array(ww*wh);
   for(let ly=0;ly<wh;ly++)for(let lx=0;lx<ww;lx++){ if(lx>=pad&&lx<pad+t&&ly>=pad&&ly<pad+t&&A[(ly-pad)*t+(lx-pad)]>0.03)fp[ly*ww+lx]=1; }
@@ -685,9 +726,14 @@ function run(){ if(!SRC)return; const size=pickSize(); if(size==null)return;
   else { const T=size,W=SRC.width,H=SRC.height,m=(W>=1024&&H>=1024)?64:32; const map={br:[W-T-m,H-T-m],bl:[m,H-T-m],tr:[W-T-m,m],tl:[m,m]};[ox,oy]=map[sel];corner=sel; }
   ox+=+$('#nudgeX').value||0; oy+=+$('#nudgeY').value||0;
   const c=$('#wcolor').value,W255=[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
-  const map=mapForSize(used),auto=$('#autoOpac').checked;
-  const strength=auto?calibrateStrength(map,ox,oy,W255):(+$('#strength').value)/100;
+  let map=mapForSize(used); const auto=$('#autoOpac').checked;
+  let strength;
+  if(auto){ const fit=calibrateFit(map,ox,oy,W255); strength=fit[0]; LAST_SOFTNESS=fit[1]; }
+  /* manual strength keeps the last fitted edge softness so toggling auto off
+     doesn't visibly change the mark's edges */
+  else strength=(+$('#strength').value)/100;
   LAST_STRENGTH_PCT=Math.round(strength*100);
+  map=softenMap(map,LAST_SOFTNESS);
   const out=removeAt(map,ox,oy,W255,strength); if($('#feather').checked)featherEdges(out,ox,oy,map);
   if($('#reconstruct').checked)reconstructFlat(out,ox,oy,map);
   LAST={out,ox,oy,size:used};

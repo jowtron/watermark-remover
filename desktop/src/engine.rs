@@ -608,8 +608,69 @@ pub fn calibrate_strength(
     oy: i64,
     color: [u8; 3],
 ) -> f32 {
+    calibrate_fit(src, w, h, map, ox, oy, color).0
+}
+
+/// 3×3 box blur of a square α-map (edge-clamped) — the "softened" template.
+fn box3_alpha(a: &[f32], t: usize) -> Vec<f32> {
+    let mut out = vec![0f32; t * t];
+    for y in 0..t {
+        for x in 0..t {
+            let mut s = 0f32;
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let yy = (y as i64 + dy).clamp(0, t as i64 - 1) as usize;
+                    let xx = (x as i64 + dx).clamp(0, t as i64 - 1) as usize;
+                    s += a[yy * t + xx];
+                }
+            }
+            out[y * t + x] = s / 9.0;
+        }
+    }
+    out
+}
+
+/// The profile blended toward its 3×3 box blur by `softness` ∈ [0,1].
+/// Some Gemini cohorts stamp a slightly softer-edged star than the measured
+/// template (resampled rendering); removal with the raw template then leaves a
+/// bright rim (edge under-removed) and a dark inner ring. `calibrate_fit`
+/// measures the blend per image.
+pub fn soften_map(map: &AlphaMap, softness: f32) -> AlphaMap {
+    if softness <= 0.0 {
+        return map.clone();
+    }
+    let b = box3_alpha(&map.a, map.size);
+    let a = map
+        .a
+        .iter()
+        .zip(b.iter())
+        .map(|(&v, &bv)| v * (1.0 - softness) + bv * softness)
+        .collect();
+    AlphaMap::new(map.size, a)
+}
+
+/// Jointly fit `(strength, edge softness)` for the mark at `(ox, oy)` by
+/// paired-pixel regression: each marked pixel is paired with the nearest
+/// un-marked pixel along 8 directions as its local background estimate `b`,
+/// giving a direct per-pixel solve `s = (o − b) / (α (c − b))` from the blend
+/// model `o = b(1−αs) + c·αs`. For each candidate softness the strength is the
+/// median solve over the star core (α ≥ 0.30), and the winning softness is the
+/// one whose model leaves the smallest median absolute residual across *all*
+/// pairs (which is edge-dominated). Pairs whose background is too close to the
+/// mark colour are skipped — there the blend is insensitive to `s`, which is
+/// also what makes this robust to hard art edges crossing the tile (the
+/// failure mode of the residual-correlation method, kept as fallback).
+/// Mirrors `calibrateFit` in the web app.
+pub fn calibrate_fit(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    map: &AlphaMap,
+    ox: i64,
+    oy: i64,
+    color: [u8; 3],
+) -> (f32, f32) {
     let t = map.size;
-    let a = &map.a;
     let lum_w = 0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32;
     // Observed tile luminance (clamped sampling at image edges).
     let mut o = vec![0f32; t * t];
@@ -623,43 +684,74 @@ pub fn calibrate_strength(
         }
     }
     const DIRS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
-    let mut samples: Vec<f32> = Vec::new();
-    for y in 0..t {
-        for x in 0..t {
-            let av = a[y * t + x];
-            if av < 0.30 {
-                continue;
-            }
-            for (dx, dy) in DIRS {
-                let (mut cx, mut cy) = (x as i32, y as i32);
-                for _ in 0..40 {
-                    cx += dx;
-                    cy += dy;
-                    if cx < 0 || cy < 0 || cx >= t as i32 || cy >= t as i32 {
-                        break;
-                    }
-                    if a[cy as usize * t + cx as usize] < 0.02 {
-                        let b = o[cy as usize * t + cx as usize];
-                        if (lum_w - b).abs() >= 40.0 {
-                            samples.push((o[y * t + x] - b) / (av * (lum_w - b)));
+    let box3 = box3_alpha(&map.a, t);
+    let mut best: Option<(f32, f32, f32)> = None; // (residual, strength, softness)
+    for step in 0..=4 {
+        let soft = step as f32 * 0.25;
+        let a: Vec<f32> = map
+            .a
+            .iter()
+            .zip(box3.iter())
+            .map(|(&v, &bv)| v * (1.0 - soft) + bv * soft)
+            .collect();
+        // (α, observed, background) triples for every usable pair
+        let mut pairs: Vec<(f32, f32, f32)> = Vec::new();
+        for y in 0..t {
+            for x in 0..t {
+                let av = a[y * t + x];
+                if av < 0.05 {
+                    continue;
+                }
+                for (dx, dy) in DIRS {
+                    let (mut cx, mut cy) = (x as i32, y as i32);
+                    for _ in 0..40 {
+                        cx += dx;
+                        cy += dy;
+                        if cx < 0 || cy < 0 || cx >= t as i32 || cy >= t as i32 {
+                            break;
                         }
-                        break;
+                        if a[cy as usize * t + cx as usize] < 0.02 {
+                            let b = o[cy as usize * t + cx as usize];
+                            if (lum_w - b).abs() >= 40.0 {
+                                pairs.push((av, o[y * t + x], b));
+                            }
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
-    if samples.len() >= 20 {
-        samples.sort_by(|p, q| p.partial_cmp(q).unwrap());
-        let n = samples.len();
-        let med = if n % 2 == 1 {
-            samples[n / 2]
-        } else {
-            (samples[n / 2 - 1] + samples[n / 2]) / 2.0
+        let median = |v: &mut Vec<f32>| -> f32 {
+            v.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            let n = v.len();
+            if n % 2 == 1 {
+                v[n / 2]
+            } else {
+                (v[n / 2 - 1] + v[n / 2]) / 2.0
+            }
         };
-        return med.clamp(0.30, 1.20);
+        let mut core: Vec<f32> = pairs
+            .iter()
+            .filter(|(av, _, _)| *av >= 0.30)
+            .map(|(av, ov, b)| (ov - b) / (av * (lum_w - b)))
+            .collect();
+        if core.len() < 20 {
+            continue;
+        }
+        let s = median(&mut core).clamp(0.30, 1.20);
+        let mut res: Vec<f32> = pairs
+            .iter()
+            .map(|(av, ov, b)| (ov - b - av * s * (lum_w - b)).abs())
+            .collect();
+        let r = median(&mut res);
+        if best.map_or(true, |(br, _, _)| r < br) {
+            best = Some((r, s, soft));
+        }
     }
-    calibrate_strength_residual(src, w, h, map, ox, oy, color)
+    match best {
+        Some((_, s, soft)) => (s, soft),
+        None => (calibrate_strength_residual(src, w, h, map, ox, oy, color), 0.0),
+    }
 }
 
 /// The pre-2026-07-22 auto-opacity: the strength at which the un-blended tile
@@ -862,7 +954,7 @@ pub fn reconstruct_flat(out: &mut [u8], w: usize, h: usize, map: &AlphaMap, ox: 
     }
     let blur = box_blur(&lum, ww, wh, 7);
     // Flatness = 1 when the ring around the tile is smooth, → 0 when textured.
-    let (mut s, mut ss, mut n) = (0f64, 0f64, 0usize);
+    let (mut s, mut ss, mut lsum, mut n) = (0f64, 0f64, 0f64, 0usize);
     for ly in 0..wh {
         for lx in 0..ww {
             if lx >= pad && lx < pad + t && ly >= pad && ly < pad + t {
@@ -871,12 +963,18 @@ pub fn reconstruct_flat(out: &mut [u8], w: usize, h: usize, map: &AlphaMap, ox: 
             let hp = (lum[ly * ww + lx] - blur[ly * ww + lx]) as f64;
             s += hp;
             ss += hp * hp;
+            lsum += lum[ly * ww + lx] as f64;
             n += 1;
         }
     }
     let mean = s / n as f64;
     let flat = (ss / n as f64 - mean * mean).max(0.0).sqrt() as f32;
     let flatness = (1.0 - (flat - 2.5) / 7.0).clamp(0.0, 1.0);
+    // Absolute σ misreads dark textured art as flat (σ is small only because
+    // the pixels are dark) — also require low *contrast-relative* texture, or
+    // the surface fit wipes real texture under the mark.
+    let rel = flat / (lsum / n as f64 + 12.0) as f32;
+    let flatness = flatness * ((0.12 - rel) / 0.09).clamp(0.0, 1.0);
     if flatness <= 0.05 {
         return; // textured background — leave the un-blend untouched
     }
@@ -1291,6 +1389,100 @@ mod tests {
         assert!(
             (s - true_scale).abs() <= 0.12,
             "calibrated scale {s} vs true {true_scale} despite hard edge"
+        );
+    }
+
+    /// A mark stamped with a softer edge than the template (a resampled ✦, as
+    /// some Gemini cohorts produce) must be detected by `calibrate_fit` as
+    /// softness > 0, with the strength still recovered — a uniform-scale fit
+    /// leaves a bright rim / dark inner ring there.
+    #[test]
+    fn calibrate_fits_soft_edge() {
+        let map = default_map();
+        let (w, h) = (500usize, 400usize);
+        let t = 96usize;
+        let (ox, oy) = ((w - t - 64) as i64, (h - t - 64) as i64);
+        let true_scale = 0.6f32;
+        let soft_a = box3_alpha(&map.a, t); // fully softened template
+        let mut obs = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = (60.0 + 40.0 * ((x as f32 / 37.0).sin() + (y as f32 / 53.0).cos())) as u8;
+                obs[i] = v;
+                obs[i + 1] = v;
+                obs[i + 2] = v;
+                obs[i + 3] = 255;
+            }
+        }
+        for y in 0..t {
+            for x in 0..t {
+                let av = (soft_a[y * t + x] * true_scale).min(0.98);
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let (s, soft) = calibrate_fit(&obs, w, h, &map, ox, oy, [255, 255, 255]);
+        assert!(soft >= 0.5, "fitted softness {soft} for a fully soft mark");
+        assert!(
+            (s - true_scale).abs() <= 0.12,
+            "calibrated scale {s} vs true {true_scale}"
+        );
+        // and an unsoftened mark must fit softness ≈ 0
+        let mut obs2 = obs.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = (60.0 + 40.0 * ((x as f32 / 37.0).sin() + (y as f32 / 53.0).cos())) as u8;
+                obs2[i] = v;
+                obs2[i + 1] = v;
+                obs2[i + 2] = v;
+            }
+        }
+        for y in 0..t {
+            for x in 0..t {
+                let av = (map.a[y * t + x] * true_scale).min(0.98);
+                let i = ((oy as usize + y) * w + (ox as usize + x)) * 4;
+                for c in 0..3 {
+                    let v = obs2[i + c] as f32 * (1.0 - av) + 255.0 * av;
+                    obs2[i + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let (_, soft2) = calibrate_fit(&obs2, w, h, &map, ox, oy, [255, 255, 255]);
+        assert!(soft2 <= 0.25, "fitted softness {soft2} for a sharp mark");
+    }
+
+    /// The flatness gate must also be contrast-relative: dark textured art has
+    /// a small *absolute* high-pass σ (only because the pixels are dark) and
+    /// used to pass as "flat", letting the surface fit wipe real texture.
+    #[test]
+    fn reconstruct_flat_skips_dark_texture() {
+        let map = default_map();
+        let (w, h) = (500usize, 400usize);
+        let t = 96usize;
+        let (ox, oy) = ((w - t - 64) as i64, (h - t - 64) as i64);
+        let mut obs = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                // dark background with fine ±6 texture (absolute σ ≈ 4)
+                let v = (10 + ((x * 7 + y * 13) % 13) as i32 - 6).clamp(0, 255) as u8;
+                obs[i] = v;
+                obs[i + 1] = v;
+                obs[i + 2] = v;
+                obs[i + 3] = 255;
+            }
+        }
+        let before = obs.clone();
+        let mut out = obs;
+        reconstruct_flat(&mut out, w, h, &map, ox, oy);
+        assert_eq!(
+            out, before,
+            "reconstruct_flat must be a no-op on dark textured background"
         );
     }
 

@@ -125,11 +125,12 @@ fn batch_main(args: &[String]) {
                     Some(d) => {
                         let map = removal_map(&profile, d.size);
                         let color = [255u8, 255, 255];
-                        let strength = if calibrate {
-                            engine::calibrate_strength(&img.rgba, img.w, img.h, &map, d.ox, d.oy, color)
+                        let (strength, softness) = if calibrate {
+                            engine::calibrate_fit(&img.rgba, img.w, img.h, &map, d.ox, d.oy, color)
                         } else {
-                            1.0
+                            (1.0, 0.0)
                         };
+                        let map = engine::soften_map(&map, softness);
                         let mut out =
                             engine::remove_at(&img.rgba, img.w, img.h, &map, d.ox, d.oy, color, strength);
                         if feather {
@@ -142,8 +143,8 @@ fn batch_main(args: &[String]) {
                         let outp = std::path::Path::new(&outdir).join(format!("{stem}-clean.png"));
                         let _ = engine::save_png(&outp, &out, img.w, img.h);
                         println!(
-                            "{:44} {:>5}x{:<5} {} ({},{}) ncc {:.3} opac {:.0}%",
-                            fname, img.w, img.h, d.corner, d.ox, d.oy, d.ncc, strength * 100.0
+                            "{:44} {:>5}x{:<5} {} ({},{}) ncc {:.3} opac {:.0}% soft {:.2}",
+                            fname, img.w, img.h, d.corner, d.ox, d.oy, d.ncc, strength * 100.0, softness
                         );
                         ok += 1;
                     }
@@ -312,6 +313,7 @@ struct App {
     color_hex: String,
     strength: i32,
     last_strength_pct: i32, // opacity actually used last run (auto or manual)
+    last_softness: f32,     // edge softness fitted by the last auto run
     auto_opacity: bool,
     feather: bool,
     reconstruct: bool,
@@ -365,6 +367,7 @@ impl App {
             color_hex: "#ffffff".into(),
             strength,
             last_strength_pct: strength,
+            last_softness: 0.0,
             auto_opacity: true,
             feather: true,
             reconstruct: true,
@@ -541,6 +544,12 @@ impl App {
                 self.status = format!("{} — {}×{}", img.name, img.w, img.h);
                 self.src = Some(img);
                 self.tab = Tab::Remove;
+                // a placement (corner + nudge, e.g. from click-to-place) is
+                // specific to one image — start the next from auto-detect
+                self.corner_sel = CornerSel::Auto;
+                self.nudge_x = "0".into();
+                self.nudge_y = "0".into();
+                self.last_softness = 0.0;
                 self.run_removal();
             }
             Err(e) => self.status = format!("Failed to load: {e}"),
@@ -670,12 +679,17 @@ impl App {
         oy += self.nudge_y.trim().parse::<i64>().unwrap_or(0);
         let color = parse_hex(&self.color_hex).unwrap_or([255, 255, 255]);
         let map = removal_map(&self.profile, used_size);
-        let strength = if self.auto_opacity {
-            engine::calibrate_strength(&src.rgba, w, h, &map, ox, oy, color)
+        let (strength, softness) = if self.auto_opacity {
+            let fit = engine::calibrate_fit(&src.rgba, w, h, &map, ox, oy, color);
+            self.last_softness = fit.1;
+            fit
         } else {
-            self.strength as f32 / 100.0
+            // manual strength keeps the last fitted edge softness so toggling
+            // auto off doesn't visibly change the mark's edges
+            (self.strength as f32 / 100.0, self.last_softness)
         };
         self.last_strength_pct = (strength * 100.0).round() as i32;
+        let map = engine::soften_map(&map, softness);
         let mut out = engine::remove_at(&src.rgba, w, h, &map, ox, oy, color, strength);
         if self.feather {
             engine::feather_edges(&mut out, w, h, &map, ox, oy);
